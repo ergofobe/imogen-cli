@@ -15,6 +15,12 @@ use crate::config::{Config, Profile};
 pub struct ProfileTokens {
     name: String,
     profile: Mutex<Profile>,
+    /// Held for the whole of a refresh, so only one is ever in flight. A refresh token is
+    /// single-use: the server rotates it and, on seeing a rotated one come back, revokes
+    /// the entire family as a stolen-token replay. Six uploads running at once all
+    /// noticing the same expiry and each spending the same refresh token is exactly that
+    /// pattern, and it signs the machine out rather than refreshing it.
+    refreshing: Mutex<()>,
     /// A token given on the command line is used as-is and never persisted.
     ephemeral: bool,
 }
@@ -24,6 +30,7 @@ impl ProfileTokens {
         Arc::new(Self {
             name: name.into(),
             profile: Mutex::new(profile),
+            refreshing: Mutex::new(()),
             ephemeral,
         })
     }
@@ -33,9 +40,20 @@ impl ProfileTokens {
         self.profile.lock().await.scope.clone()
     }
 
-    async fn refreshed(&self) -> Option<String> {
+    /// Spends `seen` for a new access token, unless somebody else got there first.
+    ///
+    /// Callers sample the refresh token before queueing here. Whoever wins the lock
+    /// spends it; the rest wake to find a different token saved, which says their work
+    /// has already been done for them and that spending `seen` again would be the replay
+    /// the server revokes for.
+    async fn refresh_from(&self, seen: &str) -> Option<String> {
+        let _guard = self.refreshing.lock().await;
+
         let (server, client_id, refresh_token) = {
             let profile = self.profile.lock().await;
+            if profile.refresh_token.as_deref() != Some(seen) {
+                return profile.access_token.clone();
+            }
             (
                 profile.server.clone(),
                 profile.client_id.clone()?,
@@ -58,14 +76,25 @@ impl ProfileTokens {
         *self.profile.lock().await = updated;
         access
     }
+
+    /// The refresh token as it stands, to be handed back to `refresh_from`.
+    async fn current_refresh_token(&self) -> Option<String> {
+        self.profile.lock().await.refresh_token.clone()
+    }
 }
 
 impl TokenSource for ProfileTokens {
     fn token(&self) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
-            if self.profile.lock().await.needs_refresh() {
-                if let Some(token) = self.refreshed().await {
-                    return Some(token);
+            let (stale, seen) = {
+                let profile = self.profile.lock().await;
+                (profile.needs_refresh(), profile.refresh_token.clone())
+            };
+            if stale {
+                if let Some(seen) = seen {
+                    if let Some(token) = self.refresh_from(&seen).await {
+                        return Some(token);
+                    }
                 }
             }
             self.profile.lock().await.access_token.clone()
@@ -75,7 +104,10 @@ impl TokenSource for ProfileTokens {
 
 impl RefreshToken for ProfileTokens {
     fn refresh(&self) -> BoxFuture<'_, Option<String>> {
-        Box::pin(async move { self.refreshed().await })
+        Box::pin(async move {
+            let seen = self.current_refresh_token().await?;
+            self.refresh_from(&seen).await
+        })
     }
 }
 
@@ -236,3 +268,206 @@ const DONE_PAGE: &str = r#"<!doctype html>
   <strong>Connected</strong>
   <p>You can close this tab and go back to your terminal.</p>
 </div>"#;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    use super::*;
+
+    /// An authorization server that rotates refresh tokens and, like the real one,
+    /// revokes the whole family when a rotated token comes back. Counts what it is asked.
+    struct FakeAuthServer {
+        port: u16,
+        grants: Arc<AtomicUsize>,
+        revoked: Arc<AtomicUsize>,
+    }
+
+    impl FakeAuthServer {
+        fn start() -> Self {
+            let listener = StdListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let grants = Arc::new(AtomicUsize::new(0));
+            let revoked = Arc::new(AtomicUsize::new(0));
+
+            let (grants_bg, revoked_bg) = (grants.clone(), revoked.clone());
+            std::thread::spawn(move || {
+                // Every refresh token this server has already spent, and whether the
+                // family has been revoked for a replay.
+                let spent: StdMutex<HashSet<String>> = StdMutex::new(HashSet::new());
+                let mut issued = 0usize;
+
+                for stream in listener.incoming() {
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    let mut buffer = [0u8; 4096];
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+
+                    let body = if request.starts_with("GET /.well-known") {
+                        let base = format!("http://127.0.0.1:{port}");
+                        serde_json::json!({
+                            "issuer": base,
+                            "authorization_endpoint": format!("{base}/oauth/authorize"),
+                            "token_endpoint": format!("{base}/oauth/token"),
+                        })
+                        .to_string()
+                    } else {
+                        let presented = request
+                            .rsplit("refresh_token=")
+                            .next()
+                            .unwrap_or_default()
+                            .split('&')
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+
+                        let mut spent = spent.lock().unwrap();
+                        if revoked_bg.load(Ordering::SeqCst) > 0 || !spent.insert(presented) {
+                            // A replay: the family goes, exactly as the server does it.
+                            revoked_bg.fetch_add(1, Ordering::SeqCst);
+                            let error = serde_json::json!({
+                                "error": "invalid_grant",
+                                "error_description": "refresh token has already been rotated",
+                            })
+                            .to_string();
+                            let _ = stream.write_all(
+                                format!(
+                                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    error.len(),
+                                    error
+                                )
+                                .as_bytes(),
+                            );
+                            continue;
+                        }
+
+                        issued += 1;
+                        grants_bg.fetch_add(1, Ordering::SeqCst);
+                        serde_json::json!({
+                            "access_token": format!("at{issued}"),
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "refresh_token": format!("rt{issued}"),
+                            "scope": "library:read",
+                        })
+                        .to_string()
+                    };
+
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+
+            Self {
+                port,
+                grants,
+                revoked,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+    }
+
+    /// A profile whose access token expired a moment ago, so every caller agrees it is
+    /// stale and they all reach for the refresh token together.
+    fn expired_profile(server: String) -> Profile {
+        Profile {
+            server,
+            client_id: Some("client".into()),
+            access_token: Some("at0".into()),
+            refresh_token: Some("rt0".into()),
+            expires_in: 3600,
+            obtained_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                - 3_600_000,
+            scope: "library:read".into(),
+        }
+    }
+
+    /// Six concurrent uploads hitting the same expiry must spend the refresh token once.
+    /// Spending it six times is what the server reads as a stolen token, and it answers
+    /// by revoking the family — signing the machine out in the middle of the run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_refresh_spends_the_token_once() {
+        let server = FakeAuthServer::start();
+        let tokens = ProfileTokens::new("test", expired_profile(server.url()), true);
+
+        let results = futures::future::join_all((0..6).map(|_| {
+            let tokens = tokens.clone();
+            async move { tokens.token().await }
+        }))
+        .await;
+
+        assert_eq!(
+            server.grants.load(Ordering::SeqCst),
+            1,
+            "the refresh token must be spent once, not once per request in flight"
+        );
+        assert_eq!(
+            server.revoked.load(Ordering::SeqCst),
+            0,
+            "a replayed refresh token revokes the family and signs the machine out"
+        );
+        for result in &results {
+            assert_eq!(
+                result.as_deref(),
+                Some("at1"),
+                "every caller gets the new token"
+            );
+        }
+    }
+
+    /// The 401 path is the same token, reached a different way: several requests failing
+    /// at once must still produce one refresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_unauthorized_retries_spend_the_token_once() {
+        let server = FakeAuthServer::start();
+        let tokens = ProfileTokens::new("test", expired_profile(server.url()), true);
+
+        futures::future::join_all((0..6).map(|_| {
+            let tokens = tokens.clone();
+            async move { RefreshToken::refresh(&*tokens).await }
+        }))
+        .await;
+
+        assert_eq!(server.grants.load(Ordering::SeqCst), 1);
+        assert_eq!(server.revoked.load(Ordering::SeqCst), 0);
+    }
+
+    /// A later expiry is a real refresh, not a coalesced one: the guard must not wedge
+    /// the profile on the first token it ever fetched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_later_expiry_refreshes_again() {
+        let server = FakeAuthServer::start();
+        let tokens = ProfileTokens::new("test", expired_profile(server.url()), true);
+
+        assert_eq!(tokens.token().await.as_deref(), Some("at1"));
+
+        // Age the freshly-minted token the way another hour of uploading would.
+        {
+            let mut profile = tokens.profile.lock().await;
+            profile.obtained_at -= 3_600_000;
+        }
+
+        assert_eq!(tokens.token().await.as_deref(), Some("at2"));
+        assert_eq!(server.grants.load(Ordering::SeqCst), 2);
+        assert_eq!(server.revoked.load(Ordering::SeqCst), 0);
+    }
+}
