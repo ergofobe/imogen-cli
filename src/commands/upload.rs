@@ -198,7 +198,12 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
     for (album_id, asset_ids) in &by_album {
         // Album membership goes on in chunks: an imported album can hold thousands.
         for chunk in asset_ids.chunks(500) {
-            match ctx.client.albums.add_assets(album_id, &AssetSelection::ids(chunk)).await {
+            match ctx
+                .client
+                .albums
+                .add_assets(album_id, &AssetSelection::ids(chunk))
+                .await
+            {
                 Ok(result) => added += result.added,
                 Err(error) => ctx.out.warn(format!("Could not fill an album: {error}")),
             }

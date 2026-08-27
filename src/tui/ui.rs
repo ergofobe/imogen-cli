@@ -18,6 +18,9 @@ use crate::tui::app::{App, Mode, Tile};
 const ACCENT: Color = Color::Rgb(0xE0, 0xA1, 0x62);
 const MUTED: Color = Color::Rgb(0x90, 0x96, 0xA0);
 
+/// The gutter down the right of the grid: four cells for a year and one for the marker.
+const RAIL: u16 = 5;
+
 /// Works out where everything goes, including the holes the photographs are placed into.
 /// Called before drawing so the placement pass and the draw pass agree.
 pub fn layout(app: &mut App, area: Rect) {
@@ -42,6 +45,7 @@ pub fn layout(app: &mut App, area: Rect) {
     };
 
     app.grid_area = content;
+    app.rail_area = Rect::default();
     app.tiles.clear();
 
     if matches!(app.mode, Mode::Picker | Mode::PickerPath(_)) {
@@ -61,7 +65,7 @@ pub fn layout(app: &mut App, area: Rect) {
     }
 
     if app.mode == Mode::Viewer {
-        if let Some(asset) = app.selected_asset() {
+        if let Some(id) = app.selected_id() {
             let inner = Rect {
                 x: content.x + 1,
                 y: content.y + 1,
@@ -69,7 +73,7 @@ pub fn layout(app: &mut App, area: Rect) {
                 height: content.height.saturating_sub(2),
             };
             app.tiles.push(Tile {
-                id: asset.id.clone(),
+                id,
                 inner,
                 index: app.selected,
             });
@@ -80,6 +84,23 @@ pub fn layout(app: &mut App, area: Rect) {
         return;
     }
 
+    // The year rail only earns its gutter if what is left still fits a tile.
+    let content = if content.width > RAIL + app.tile_width {
+        app.rail_area = Rect {
+            x: content.x + content.width - RAIL,
+            y: content.y,
+            width: RAIL,
+            height: content.height,
+        };
+        Rect {
+            width: content.width - RAIL,
+            ..content
+        }
+    } else {
+        content
+    };
+    app.grid_area = content;
+
     let columns = (content.width / app.tile_width.max(1)).max(1) as usize;
     app.columns = columns;
     let visible = (content.height / app.tile_height.max(1)).max(1) as usize;
@@ -87,13 +108,13 @@ pub fn layout(app: &mut App, area: Rect) {
     for row in 0..visible {
         for column in 0..columns {
             let index = (app.scroll + row) * columns + column;
-            let Some(asset) = app.assets.get(index) else {
+            let Some(tile) = app.window.get(index) else {
                 continue;
             };
             let x = content.x + column as u16 * app.tile_width;
             let y = content.y + row as u16 * app.tile_height;
             app.tiles.push(Tile {
-                id: asset.id.clone(),
+                id: tile.id.clone(),
                 // One cell of border all round, and the last row of the tile is the caption.
                 inner: Rect {
                     x: x + 1,
@@ -128,6 +149,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Viewer => draw_viewer(frame, app, chunks[1]),
         _ => {
             draw_grid(frame, app);
+            draw_rail(frame, app);
             if app.show_info {
                 let split = Layout::default()
                     .direction(Direction::Horizontal)
@@ -144,11 +166,9 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
         (Some(album), _) => format!("album · {}", album.name),
         (None, scope) => scope.label().to_string(),
     };
-    let counted = match app.total {
-        Some(total) => format!("{total} photographs"),
-        None if app.cursor.is_some() => format!("{}+ loaded", app.assets.len()),
-        None => format!("{} photographs", app.assets.len()),
-    };
+    // The buckets know the whole count before a single picture has been fetched, so this
+    // never has to say "so many loaded so far".
+    let counted = format!("{} photographs", app.total);
     let mut left = vec![
         Span::styled(
             " imogen ",
@@ -180,6 +200,7 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.mode {
         Mode::Search(input) => format!(" search: {input}▏"),
+        Mode::JumpDate(input) => format!(" jump to: {input}▏"),
         Mode::PickerPath(input) => format!(" go to: {input}▏"),
         Mode::Picker => {
             let picker = app.picker.as_ref();
@@ -208,21 +229,47 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ),
         _ => match &app.status {
             Some(status) => format!(" {status}"),
-            None => match app.selected_asset() {
-                Some(asset) => format!(
-                    " {}  ·  {}  ·  {}{}",
-                    output::truncate(&asset.original_filename, 40),
-                    output::date(&asset.captured_at),
-                    output::bytes(asset.size_bytes),
-                    if asset.favorite { "  ★" } else { "" }
-                ),
-                None => " nothing here".to_string(),
+            // The filename and the size come from the whole record, which is only read
+            // for the photograph being looked at; the day comes from the tile, which is
+            // always there. Waiting for the record before saying anything would leave the
+            // footer blank for every photograph somebody merely scrolled past.
+            None => match app.selected_tile() {
+                Some(tile) => {
+                    let named = match app.detail() {
+                        Some(asset) => format!(
+                            "{}  ·  {}  ·  ",
+                            output::truncate(&asset.original_filename, 40),
+                            output::bytes(asset.size_bytes)
+                        ),
+                        None => String::new(),
+                    };
+                    format!(
+                        " {named}{}  ·  {} of {}{}",
+                        output::date(&tile.captured_at),
+                        app.selected + 1,
+                        app.total,
+                        if tile.favorite { "  ★" } else { "" }
+                    )
+                }
+                // The buckets know what day this is even before its tiles arrive, so a
+                // stretch still on its way says where it is rather than "nothing here" —
+                // which is what an empty library says, and means something else.
+                None => match app.date_at_index(app.selected) {
+                    Some(date) => format!(
+                        " {}  ·  {} of {}",
+                        output::date(&format!("{date}T00:00:00.000Z")),
+                        app.selected + 1,
+                        app.total
+                    ),
+                    None if app.loading => " loading…".to_string(),
+                    None => " nothing here".to_string(),
+                },
             },
         },
     };
 
     let style = match &app.mode {
-        Mode::Search(_) | Mode::PickerPath(_) => Style::default().fg(ACCENT),
+        Mode::Search(_) | Mode::PickerPath(_) | Mode::JumpDate(_) => Style::default().fg(ACCENT),
         Mode::Picker => Style::default().fg(MUTED),
         Mode::Confirm { .. } => Style::default().fg(Color::Rgb(0xE0, 0x7A, 0x5F)),
         _ if app.uploading() => Style::default().fg(ACCENT),
@@ -247,7 +294,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_grid(frame: &mut Frame, app: &App) {
-    if app.assets.is_empty() {
+    if app.total == 0 {
         let message = if app.loading {
             "Loading…"
         } else if app.query.is_empty() {
@@ -265,8 +312,23 @@ fn draw_grid(frame: &mut Frame, app: &App) {
         return;
     }
 
+    if app.tiles.is_empty() {
+        // The spine says there are photographs here; their tiles are still on their way.
+        let where_at = app
+            .date_at_index(app.selected)
+            .map(|date| format!("Fetching {date}…"))
+            .unwrap_or_else(|| "Fetching…".to_string());
+        frame.render_widget(
+            Paragraph::new(where_at)
+                .style(Style::default().fg(MUTED))
+                .alignment(Alignment::Center),
+            centred(app.grid_area, 30, 1),
+        );
+        return;
+    }
+
     for tile in &app.tiles {
-        let Some(asset) = app.assets.get(tile.index) else {
+        let Some(held) = app.window.get(tile.index) else {
             continue;
         };
         let selected = tile.index == app.selected;
@@ -295,18 +357,18 @@ fn draw_grid(frame: &mut Frame, app: &App) {
             height: 1,
         };
         let mut marks = String::new();
-        if asset.favorite {
+        if held.favorite {
             marks.push('★');
         }
-        if asset.r#type == AssetType::Video {
+        if held.r#type == AssetType::Video {
             marks.push('▶');
         }
-        if asset.status != AssetStatus::Ready {
+        if held.status != AssetStatus::Ready {
             marks.push('·');
         }
         let label = format!(
             "{}{}",
-            output::date(&asset.captured_at),
+            output::date(&held.captured_at),
             if marks.is_empty() {
                 String::new()
             } else {
@@ -327,11 +389,48 @@ fn draw_grid(frame: &mut Frame, app: &App) {
     }
 }
 
+/// The year rail: where you are in twenty years, in five cells.
+///
+/// The grid itself cannot say this — a screen of tiles looks the same in 2009 as in 2024 —
+/// so the rail is the only thing on screen that answers "how far in am I".
+fn draw_rail(frame: &mut Frame, app: &App) {
+    let area = app.rail_area;
+    if area.width == 0 || area.height == 0 || app.total == 0 {
+        return;
+    }
+    let here = app.rail_row(area.height);
+    let marks = app.year_marks(area.height);
+
+    let lines: Vec<Line> = (0..area.height)
+        .map(|row| {
+            let year = marks
+                .iter()
+                .find(|(at, _)| *at == row)
+                .map(|(_, year)| year.as_str())
+                .unwrap_or("");
+            let style = if row == here {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            Line::from(Span::styled(
+                format!("{}{year:>4}", if row == here { "\u{203a}" } else { " " }),
+                style,
+            ))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_viewer(frame: &mut Frame, app: &App, area: Rect) {
-    let title = app
-        .selected_asset()
-        .map(|asset| format!(" {} ", asset.original_filename))
-        .unwrap_or_default();
+    // The filename once the record has arrived, the day until then: a viewer with no
+    // title at all reads as a viewer that has failed.
+    let title = match (app.detail(), app.selected_tile()) {
+        (Some(asset), _) => format!(" {} ", asset.original_filename),
+        (None, Some(tile)) => format!(" {} ", output::date(&tile.captured_at)),
+        (None, None) => String::new(),
+    };
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -340,8 +439,8 @@ fn draw_viewer(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
     let showing = app
-        .selected_asset()
-        .map(|asset| app.preview_for(&asset.id).is_some())
+        .selected_id()
+        .map(|id| app.preview_for(&id).is_some())
         .unwrap_or(false);
     if !showing {
         frame.render_widget(
@@ -517,7 +616,7 @@ fn draw_albums(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_info(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(asset) = app.selected_asset() else {
+    let Some(asset) = app.detail() else {
         return;
     };
     let mut lines = vec![
@@ -592,7 +691,9 @@ fn draw_help(frame: &mut Frame, area: Rect, picking: bool) {
         ("a", "albums"),
         ("u", "pick files to upload"),
         ("1 2 3 4", "library · favourites · archive · trash"),
-        ("g  G", "first · last"),
+        ("g", "jump to a date — 2011, aug 2011, 2011-08-14"),
+        ("[  ]", "a year older · a year newer"),
+        ("home  end", "first · last"),
         ("R", "reload"),
         ("?", "this"),
         ("q", "quit"),
@@ -655,6 +756,7 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::tui::picker::Picker;
+    use imogen_sdk::{AssetStatus, AssetType};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -778,6 +880,108 @@ mod tests {
             .to_string_lossy()
             .to_string();
         assert!(render(&mut app, 100, 20).contains(&name));
+    }
+
+    /// Not an assertion — prints the grid so the rail can be looked at.
+    #[test]
+    #[ignore = "for looking at, not for CI"]
+    fn show_grid() {
+        let mut app = browsing();
+        app.selected = 500;
+        app.keep_selection_visible();
+        println!("{}", render(&mut app, 90, 24));
+    }
+
+    /// A grid over twenty years, so the rail has something to say.
+    fn browsing() -> App {
+        let mut app = App::new();
+        app.buckets = (0..20)
+            .map(|n| imogen_sdk::TimelineBucket {
+                date: format!("{}-06-01", 2024 - n),
+                count: 40,
+                cover_asset_id: None,
+            })
+            .collect();
+        app.recount();
+        app.periods.insert(
+            "2024-06".into(),
+            (0..40)
+                .map(|n| imogen_sdk::TimelineTile {
+                    id: format!("a{n}"),
+                    captured_at: "2024-06-01T09:30:00.000Z".into(),
+                    width: None,
+                    height: None,
+                    r#type: AssetType::Image,
+                    status: AssetStatus::Ready,
+                    favorite: false,
+                    duration: None,
+                    placeholder_color: None,
+                    live_photo_video_id: None,
+                })
+                .collect(),
+        );
+        app.rebuild_window();
+        app
+    }
+
+    /// The grid itself looks the same in 2009 as in 2024. The rail is the only thing on
+    /// screen that says how far into twenty years you are.
+    #[test]
+    fn the_year_rail_says_where_in_the_library_you_are() {
+        let mut app = browsing();
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("2024"), "{screen}");
+        assert!(
+            screen.contains("›"),
+            "the cursor has a place on the rail: {screen}"
+        );
+        // And the rail is in its gutter, not over the tiles.
+        assert!(app.rail_area.width > 0);
+        assert_eq!(
+            app.rail_area.x + app.rail_area.width,
+            app.grid_area.x + app.grid_area.width + RAIL
+        );
+    }
+
+    /// A narrow window keeps the photographs and loses the rail, rather than the other way
+    /// round.
+    #[test]
+    fn a_window_too_narrow_for_both_keeps_the_photographs() {
+        let mut app = browsing();
+        render(&mut app, 22, 30);
+        assert_eq!(app.rail_area.width, 0);
+        assert!(app.columns >= 1);
+    }
+
+    /// "Nothing here" is what an empty library says. A stretch whose tiles have not
+    /// arrived is a different thing, and saying the wrong one of the two reads as a
+    /// browser that has broken.
+    #[test]
+    fn a_stretch_still_on_its_way_says_where_it_is_not_that_there_is_nothing() {
+        let mut app = browsing();
+        app.selected = 500;
+        app.keep_selection_visible();
+        let screen = render(&mut app, 90, 24);
+        assert!(!screen.contains("nothing here"), "{screen}");
+        assert!(screen.contains("2012"), "{screen}");
+        assert!(screen.contains("501 of 800"), "{screen}");
+    }
+
+    #[test]
+    fn the_jump_prompt_reads_like_the_search_prompt() {
+        let mut app = browsing();
+        app.mode = Mode::JumpDate("aug 2011".into());
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("jump to: aug 2011"), "{screen}");
+    }
+
+    /// The buckets know the whole count before a picture has been fetched, so the header
+    /// never has to hedge with "so many loaded so far".
+    #[test]
+    fn the_header_counts_the_whole_library_not_what_has_arrived() {
+        let mut app = browsing();
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("800 photographs"), "{screen}");
     }
 
     #[test]
