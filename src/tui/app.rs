@@ -387,6 +387,16 @@ impl App {
         None
     }
 
+    /// How many photographs the spine says a period holds. The spine is authoritative for
+    /// every index in the browser, so this is what a period is allowed to contribute.
+    pub fn period_count(&self, period: &str) -> usize {
+        self.buckets
+            .iter()
+            .filter(|bucket| bucket.date.len() >= 7 && &bucket.date[..7] == period)
+            .map(|bucket| bucket.count as usize)
+            .sum()
+    }
+
     /// The periods the viewport covers, plus one either side so stepping down a row does
     /// not stall on a fetch.
     ///
@@ -485,7 +495,14 @@ impl App {
         let mut base = None;
         let mut tiles: Vec<TimelineTile> = Vec::new();
         for (start, period) in ordered {
+            // The spine is what defines an index, so a period contributes at most the
+            // photographs the spine says it has. A tile past that is not at any valid
+            // index of its own period, and letting it through would push every photograph
+            // after it one place along — the next period's first photograph drawn under
+            // the previous period's last index. A held period can outrun its bucket when a
+            // new spine arrives over tiles that were filed against the old one.
             let held = &self.periods[&period];
+            let held = &held[..held.len().min(self.period_count(&period))];
             match base {
                 None => {
                     base = Some(start);

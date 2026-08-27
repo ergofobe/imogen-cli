@@ -1400,6 +1400,122 @@ mod tests {
         );
     }
 
+    /// Exhaustive over which periods happen to be held: the window's whole contract is
+    /// that `get(i)` is the photograph at global index `i` — the same `i` the cursor, the
+    /// caption, the viewer and `date_at_index` all use. An off-by-one anywhere in the base
+    /// arithmetic draws every tile of a partially held window one place out.
+    #[test]
+    fn every_held_tile_answers_at_its_own_global_index() {
+        // Three periods, uneven, with September split over two days so a period is not a
+        // bucket. Global indices: Sep 0-1, Aug 2-4, Jul 5.
+        let spine = vec![
+            bucket("2011-09-02", 1),
+            bucket("2011-09-01", 1),
+            bucket("2011-08-14", 3),
+            bucket("2011-07-01", 1),
+        ];
+        let contents = [
+            ("2011-09", vec![(0, "2011-09-02"), (1, "2011-09-01")]),
+            (
+                "2011-08",
+                vec![(2, "2011-08-14"), (3, "2011-08-14"), (4, "2011-08-14")],
+            ),
+            ("2011-07", vec![(5, "2011-07-01")]),
+        ];
+
+        for held in 0..(1u8 << 3) {
+            let mut app = App::new();
+            app.buckets = spine.clone();
+            app.recount();
+            assert_eq!(app.total, 6);
+
+            for (slot, (period, items)) in contents.iter().enumerate() {
+                if held & (1 << slot) == 0 {
+                    continue;
+                }
+                app.periods.insert(
+                    (*period).into(),
+                    items
+                        .iter()
+                        .map(|(index, day)| {
+                            tile(&format!("t{index}"), &format!("{day}T00:00:00.000Z"))
+                        })
+                        .collect(),
+                );
+            }
+            app.rebuild_window();
+
+            for index in 0..app.total {
+                let Some(found) = app.window.get(index) else {
+                    continue;
+                };
+                assert_eq!(
+                    found.id,
+                    format!("t{index}"),
+                    "held={held:04b}: index {index} drew {}",
+                    found.id
+                );
+                // And the window agrees with the timeline arithmetic, which walks the
+                // buckets independently of it.
+                assert_eq!(
+                    found.captured_at.split('T').next().unwrap(),
+                    app.date_at_index(index).unwrap(),
+                    "held={held:04b}: index {index} is on a different day than the spine says"
+                );
+            }
+            // The test cannot pass by holding nothing: whenever the newest period is held,
+            // its tiles must really be reachable.
+            if held & 1 != 0 {
+                assert_eq!(app.window.base, 0);
+                assert_eq!(app.window.get(0).map(|t| t.id.as_str()), Some("t0"));
+            }
+        }
+    }
+
+    /// A period cannot be allowed to outrun its bucket. The spine defines every index in
+    /// the browser, so tiles beyond what the spine says a period holds are at no valid
+    /// index of their own — and left in, they push the next period's photographs one place
+    /// along, which is the wrong photograph at a plausible position all over again.
+    ///
+    /// Reachable when a new spine arrives over tiles filed against the old one: a period
+    /// that shrank between the two leaves the window holding more than it has room for.
+    #[test]
+    fn a_period_cannot_outrun_what_the_spine_says_it_holds() {
+        let mut app = App::new();
+        app.buckets = vec![bucket("2011-09-02", 2), bucket("2011-08-14", 2)];
+        app.recount();
+        app.periods.insert(
+            "2011-09".into(),
+            vec![
+                tile("t0", "2011-09-02T00:00:00.000Z"),
+                tile("t1", "2011-09-02T00:00:00.000Z"),
+                tile("spill", "2011-09-02T00:00:00.000Z"),
+            ],
+        );
+        app.periods.insert(
+            "2011-08".into(),
+            vec![
+                tile("t2", "2011-08-14T00:00:00.000Z"),
+                tile("t3", "2011-08-14T00:00:00.000Z"),
+            ],
+        );
+        app.rebuild_window();
+
+        assert_eq!(app.window.get(0).map(|t| t.id.as_str()), Some("t0"));
+        assert_eq!(app.window.get(1).map(|t| t.id.as_str()), Some("t1"));
+        assert_ne!(
+            app.window.get(2).map(|t| t.id.as_str()),
+            Some("spill"),
+            "September's third photograph must not be drawn at August's first index"
+        );
+        assert_eq!(
+            app.window.get(2).map(|t| t.id.as_str()),
+            Some("t2"),
+            "August's own photograph belongs there"
+        );
+        assert_eq!(app.window.get(3).map(|t| t.id.as_str()), Some("t3"));
+    }
+
     #[test]
     fn the_window_answers_for_the_indices_it_holds_and_no_others() {
         let mut app = App::new();
