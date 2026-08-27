@@ -7,7 +7,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context as _, Result};
 use futures::StreamExt;
 use imogen_sdk::{
-    Album, Asset, AssetQuery, AssetSort, AssetType, ClientOptions, ImogenClient, Person, SortOrder,
+    Album, Asset, AssetFilter, AssetQuery, AssetSort, AssetType, ClientOptions, ImogenClient,
+    Person, SortOrder, TimelineQuery,
 };
 
 use crate::auth::ProfileTokens;
@@ -107,16 +108,14 @@ impl Context {
         Ok(collected)
     }
 
-    /// Translates the command-line filters into the API's query, resolving an album given
+    /// Translates the command-line filters into the API's filter, resolving an album given
     /// by name into its id on the way through.
-    pub async fn to_query(&self, args: &QueryArgs) -> Result<AssetQuery> {
+    pub async fn to_filter(&self, args: &QueryArgs) -> Result<AssetFilter> {
         let album_id = match &args.album {
             Some(reference) => Some(self.find_album(reference).await?.id),
             None => None,
         };
-        Ok(AssetQuery {
-            cursor: None,
-            limit: None,
+        Ok(AssetFilter {
             q: args.query.clone(),
             r#type: args.r#type.map(|t| match t {
                 MediaType::Image => AssetType::Image,
@@ -130,6 +129,25 @@ impl Context {
             taken_after: args.after.as_deref().map(crate::dates::to_start_of_day),
             taken_before: args.before.as_deref().map(crate::dates::to_end_of_day),
             bbox: args.bbox.clone(),
+        })
+    }
+
+    /// The same filters, in the shape a page listing wants rather than a bulk mutation.
+    pub async fn to_query(&self, args: &QueryArgs) -> Result<AssetQuery> {
+        let filter = self.to_filter(args).await?;
+        Ok(AssetQuery {
+            cursor: None,
+            limit: None,
+            q: filter.q,
+            r#type: filter.r#type,
+            album_id: filter.album_id,
+            person_id: filter.person_id,
+            favorite: filter.favorite,
+            archived: filter.archived,
+            trashed: filter.trashed,
+            taken_after: filter.taken_after,
+            taken_before: filter.taken_before,
+            bbox: filter.bbox,
             sort: args.sort.map(|s| match s {
                 SortField::CapturedAt => AssetSort::CapturedAt,
                 SortField::CreatedAt => AssetSort::CreatedAt,
@@ -140,6 +158,21 @@ impl Context {
                 CliOrder::Desc => SortOrder::Desc,
             }),
         })
+    }
+
+    /// How many photographs a filter matches, from the timeline's day buckets rather than
+    /// a walk of every page — the number a confirmation prompt needs, not the assets
+    /// themselves.
+    pub async fn count(&self, filter: &AssetFilter) -> Result<u64> {
+        let timeline = self
+            .client
+            .assets
+            .timeline(&TimelineQuery {
+                covers: None,
+                filter: filter.clone(),
+            })
+            .await?;
+        Ok(timeline.buckets.iter().map(|bucket| bucket.count).sum())
     }
 
     /// An album by id, or by enough of its name to be unambiguous. Naming one is what a

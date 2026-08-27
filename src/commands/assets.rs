@@ -584,20 +584,31 @@ pub fn parse_location(input: &str) -> Result<GeoPoint> {
 }
 
 pub async fn trash(ctx: &Context, args: &TrashArgs) -> Result<()> {
-    let targets = ctx.select(&args.ids, &args.query, None).await?;
-    if targets.is_empty() {
+    if !args.ids.is_empty() {
+        let mut count = 0u64;
+        for chunk in args.ids.chunks(500) {
+            let result = ctx.client.assets.trash(&AssetSelection::ids(chunk)).await?;
+            count += result.count;
+        }
+        return report_count(ctx, count, "moved to the trash");
+    }
+    if args.query.is_empty() {
+        bail!("Name some asset ids, or give a filter such as --query or --album");
+    }
+
+    let filter = ctx.to_filter(&args.query).await?;
+    let count = ctx.count(&filter).await?;
+    if count == 0 {
         ctx.out.note("Nothing matched.");
         return Ok(());
     }
-    if args.ids.is_empty()
-        && !ctx.confirm(
-            &format!(
-                "Move {} to the trash?",
-                output::plural(targets.len(), "photograph")
-            ),
-            args.yes || ctx.out.is_json(),
-        )?
-    {
+    if !ctx.confirm(
+        &format!(
+            "Move {} to the trash?",
+            output::plural(count as usize, "photograph")
+        ),
+        args.yes || ctx.out.is_json(),
+    )? {
         ctx.out.note("Left alone.");
         return Ok(());
     }
@@ -605,60 +616,65 @@ pub async fn trash(ctx: &Context, args: &TrashArgs) -> Result<()> {
     let result = ctx
         .client
         .assets
-        .trash(&AssetSelection::ids(&targets))
+        .trash(&AssetSelection {
+            query: Some(filter),
+            ..Default::default()
+        })
         .await?;
-    if ctx.out.is_json() {
-        return ctx.out.json(&result);
-    }
-    ctx.out.note(ctx.out.paint(
-        &format!(
-            "{} moved to the trash.",
-            output::plural(result.count as usize, "photograph")
-        ),
-        GREEN,
-    ));
-    Ok(())
+    report_count(ctx, result.count, "moved to the trash")
 }
 
 pub async fn restore(ctx: &Context, args: &RestoreArgs) -> Result<()> {
-    let targets = if args.ids.is_empty() {
-        let query = crate::cli::QueryArgs {
-            trashed: true,
-            ..Default::default()
-        };
-        let assets = ctx.matching(&query, None).await?;
-        if assets.is_empty() {
-            ctx.out.note("The trash is empty.");
-            return Ok(());
+    if !args.ids.is_empty() {
+        let mut count = 0u64;
+        for chunk in args.ids.chunks(500) {
+            let result = ctx
+                .client
+                .assets
+                .restore(&AssetSelection::ids(chunk))
+                .await?;
+            count += result.count;
         }
-        if !ctx.confirm(
-            &format!(
-                "Restore all {} from the trash?",
-                output::plural(assets.len(), "photograph")
-            ),
-            args.yes || ctx.out.is_json(),
-        )? {
-            ctx.out.note("Left alone.");
-            return Ok(());
-        }
-        assets.into_iter().map(|asset| asset.id).collect()
-    } else {
-        args.ids.clone()
+        return report_count(ctx, count, "restored");
+    }
+
+    let filter = AssetFilter {
+        trashed: Some(true),
+        ..Default::default()
     };
+    let count = ctx.count(&filter).await?;
+    if count == 0 {
+        ctx.out.note("The trash is empty.");
+        return Ok(());
+    }
+    if !ctx.confirm(
+        &format!(
+            "Restore all {} from the trash?",
+            output::plural(count as usize, "photograph")
+        ),
+        args.yes || ctx.out.is_json(),
+    )? {
+        ctx.out.note("Left alone.");
+        return Ok(());
+    }
 
     let result = ctx
         .client
         .assets
-        .restore(&AssetSelection::ids(&targets))
+        .restore(&AssetSelection {
+            query: Some(filter),
+            ..Default::default()
+        })
         .await?;
+    report_count(ctx, result.count, "restored")
+}
+
+fn report_count(ctx: &Context, count: u64, verb: &str) -> Result<()> {
     if ctx.out.is_json() {
-        return ctx.out.json(&result);
+        return ctx.out.json(&json!({ "count": count }));
     }
     ctx.out.note(ctx.out.paint(
-        &format!(
-            "{} restored.",
-            output::plural(result.count as usize, "photograph")
-        ),
+        &format!("{} {verb}.", output::plural(count as usize, "photograph")),
         GREEN,
     ));
     Ok(())
