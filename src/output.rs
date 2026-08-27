@@ -224,6 +224,27 @@ pub fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+/// Truncates from the front, keeping the end. For a path, the end is the part worth
+/// keeping: `…/2019/cornwall` says where you are, `/Users/someone/Pictures/Holidays/2…`
+/// does not.
+pub fn truncate_left(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1;
+    for character in text.chars().rev() {
+        let w = character.to_string().width();
+        if used + w > width {
+            break;
+        }
+        kept.push(character);
+        used += w;
+    }
+    let tail: String = kept.into_iter().rev().collect();
+    format!("…{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +269,12 @@ mod tests {
         assert_eq!(plural(1, "photograph"), "1 photograph");
         assert_eq!(plural(0, "photograph"), "0 photographs");
         assert_eq!(plural(3, "file"), "3 files");
+    }
+
+    #[test]
+    fn a_path_is_shortened_from_the_front_so_where_you_are_survives() {
+        assert_eq!(truncate_left("/a/b/c", 20), "/a/b/c");
+        assert_eq!(truncate_left("/usr/local/share/photos", 12), "…hare/photos");
     }
 
     #[test]

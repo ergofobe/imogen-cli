@@ -7,6 +7,7 @@
 //! than mixed.
 
 mod app;
+mod picker;
 mod ui;
 
 use std::io::{stdout, IsTerminal, Write};
@@ -29,6 +30,7 @@ use ratatui::Terminal;
 use crate::context::Context;
 use crate::media;
 use crate::tui::app::{Action, App, Mode, Scope};
+use crate::tui::picker::Picker;
 
 /// A job the loop is waiting on. Boxed because the loop waits on several different kinds
 /// of request at once, and they are only the same type once they are behind a pointer.
@@ -44,6 +46,9 @@ enum Loaded {
     /// every variant of this enum as large as the largest one.
     Uploaded(PathBuf, Box<Result<imogen_sdk::AssetUploadResult>>),
     Filed(Result<u64>),
+    /// A picture decoded from the local filesystem, for the picker's preview pane.
+    /// `None` means it could not be decoded, which is recorded so it is not retried.
+    LocalPreview(PathBuf, Option<Arc<DynamicImage>>),
 }
 
 /// How many files to send at once from the browser. Lower than the command line's six:
@@ -118,6 +123,11 @@ async fn event_loop(ctx: &Context) -> Result<()> {
             app.loading = true;
             work.push(Box::pin(load_page(ctx, app.to_query(), app.cursor.clone())));
         }
+        if let Some(path) = app.picker.as_ref().and_then(wants_preview) {
+            if !app.local_previews.contains_key(&path) && app.local_wanted.insert(path.clone()) {
+                work.push(Box::pin(load_local_preview(path)));
+            }
+        }
         while app.upload_inflight < UPLOAD_CONCURRENCY {
             let Some(path) = app.upload_queue.pop_front() else {
                 break;
@@ -191,6 +201,35 @@ fn load_page(
 
 async fn load_albums(ctx: &Context) -> Loaded {
     Loaded::Albums(ctx.client.albums.list().await.map_err(Into::into))
+}
+
+/// The file under the picker's cursor, when it is one worth trying to draw.
+fn wants_preview(picker: &Picker) -> Option<PathBuf> {
+    let entry = picker.current()?;
+    if entry.is_dir
+        || !crate::tui::picker::is_previewable(&entry.path)
+        || entry.size > crate::tui::picker::PREVIEW_SIZE_LIMIT
+    {
+        return None;
+    }
+    Some(entry.path.clone())
+}
+
+/// Reading and decoding a photograph off disk is slow enough to stutter the interface, so
+/// it happens on the blocking pool rather than on the loop that draws.
+async fn load_local_preview(path: PathBuf) -> Loaded {
+    let decoded = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || {
+            let bytes = std::fs::read(&path).ok()?;
+            crate::media::decode(&bytes).ok()
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+    .map(Arc::new);
+    Loaded::LocalPreview(path, decoded)
 }
 
 async fn upload_one(ctx: &Context, path: PathBuf) -> Loaded {
@@ -307,6 +346,10 @@ fn absorb(app: &mut App, loaded: Loaded) {
                 }
             }
         }
+        Loaded::LocalPreview(path, image) => {
+            app.local_previews.insert(path, image);
+            app.images_dirty = true;
+        }
         Loaded::Filed(Ok(_)) => {}
         Loaded::Filed(Err(error)) => app.note(format!("Could not fill the album: {error}")),
     }
@@ -319,7 +362,23 @@ fn place_images(app: &App) -> Result<()> {
     queue!(out, crossterm::cursor::SavePosition)?;
     write!(out, "{}", media::kitty::clear_all())?;
 
-    if app.mode == Mode::Viewer {
+    if app.mode == Mode::Picker || app.mode == Mode::PickerPath(String::new()) {
+        if let Some(image) = app
+            .picker
+            .as_ref()
+            .and_then(wants_preview)
+            .and_then(|path| app.local_previews.get(&path))
+            .and_then(Option::as_ref)
+        {
+            let pane = app.picker_preview_area;
+            let (cols, rows) = fit(image, pane.width, pane.height);
+            let x = pane.x + (pane.width.saturating_sub(cols)) / 2;
+            let y = pane.y + (pane.height.saturating_sub(rows)) / 2;
+            if let Ok(escape) = media::place_at(image, x, y, cols, rows) {
+                write!(out, "{escape}")?;
+            }
+        }
+    } else if app.mode == Mode::Viewer {
         if let (Some((_, image)), Some(tile)) = (&app.preview, app.tiles.first()) {
             let (cols, rows) = fit(image, tile.inner.width, tile.inner.height);
             // Centre it in the pane rather than pinning it to the corner.
@@ -397,24 +456,43 @@ async fn handle_key<'a>(
         return Ok(());
     }
 
-    if let Mode::Upload(current) = &app.mode {
+    // Typing a path to jump the picker to.
+    if let Mode::PickerPath(current) = &app.mode {
         let mut input = current.clone();
         match key.code {
-            KeyCode::Esc => app.mode = Mode::Grid,
+            KeyCode::Esc => app.mode = Mode::Picker,
             KeyCode::Enter => {
-                app.mode = Mode::Grid;
-                start_upload(app, &input);
+                let target = expand(input.trim());
+                app.mode = Mode::Picker;
+                if let Some(picker) = app.picker.as_mut() {
+                    if target.is_dir() {
+                        picker.go_to(&target);
+                    } else if let Some(parent) = target.parent().filter(|p| p.is_dir()) {
+                        // A file was named: go to its folder and put the cursor on it.
+                        picker.go_to(parent);
+                        if let Some(index) = picker.entries.iter().position(|e| e.path == target) {
+                            picker.cursor = index;
+                        }
+                    } else {
+                        app.note(format!("{} is not there.", target.display()));
+                    }
+                }
             }
             KeyCode::Backspace => {
                 input.pop();
-                app.mode = Mode::Upload(input);
+                app.mode = Mode::PickerPath(input);
             }
             KeyCode::Char(c) => {
                 input.push(c);
-                app.mode = Mode::Upload(input);
+                app.mode = Mode::PickerPath(input);
             }
             _ => {}
         }
+        return Ok(());
+    }
+
+    if app.mode == Mode::Picker {
+        handle_picker_key(app, key);
         return Ok(());
     }
 
@@ -446,7 +524,13 @@ async fn handle_key<'a>(
     }
 
     if app.mode == Mode::Help {
-        app.mode = Mode::Grid;
+        // Back to wherever the overlay was opened from, so dismissing it does not also
+        // abandon a selection somebody was part way through making.
+        app.mode = if app.picker.is_some() {
+            Mode::Picker
+        } else {
+            Mode::Grid
+        };
         app.images_dirty = true;
         return Ok(());
     }
@@ -502,6 +586,7 @@ async fn handle_key<'a>(
             }
         }
         KeyCode::Char('?') => {
+            app.help_shows_picker = false;
             app.mode = Mode::Help;
             app.images_dirty = true;
         }
@@ -540,7 +625,10 @@ async fn handle_key<'a>(
             if app.uploading() {
                 app.note("Still uploading. Wait for this run to finish.");
             } else {
-                app.mode = Mode::Upload(String::new());
+                let start = app.picker_start.clone();
+                app.picker = Some(Picker::open(&start));
+                app.mode = Mode::Picker;
+                app.images_dirty = true;
             }
         }
         KeyCode::Char('R') => reload(ctx, app, work),
@@ -576,21 +664,72 @@ async fn handle_key<'a>(
     Ok(())
 }
 
-/// Turns what was typed into a queue of files. A folder is walked; a single file is taken
+fn handle_picker_key(app: &mut App, key: KeyEvent) {
+    let Some(picker) = app.picker.as_mut() else {
+        app.mode = Mode::Grid;
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.picker_start = picker.cwd.clone();
+            app.picker = None;
+            app.mode = Mode::Grid;
+            app.images_dirty = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => picker.move_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
+        KeyCode::PageUp => picker.move_by(-10),
+        KeyCode::PageDown => picker.move_by(10),
+        KeyCode::Home | KeyCode::Char('g') => picker.cursor = 0,
+        KeyCode::End | KeyCode::Char('G') => picker.cursor = picker.entries.len().saturating_sub(1),
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => picker.ascend(),
+        // Enter opens a folder and ticks a file. It never uploads, so nothing is sent by
+        // pressing return one time too many.
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+            if !picker.descend() {
+                picker.toggle();
+                picker.move_by(1);
+            }
+        }
+        KeyCode::Char(' ') => {
+            picker.toggle();
+            picker.move_by(1);
+        }
+        KeyCode::Char('a') => picker.choose_all_media(),
+        KeyCode::Char('A') => picker.chosen.clear(),
+        KeyCode::Char('.') => picker.toggle_hidden(),
+        KeyCode::Char('~') => {
+            if let Some(home) = dirs::home_dir() {
+                picker.go_to(&home);
+            }
+        }
+        KeyCode::Char('/') => app.mode = Mode::PickerPath(String::new()),
+        KeyCode::Char('?') => {
+            app.help_shows_picker = true;
+            app.mode = Mode::Help;
+        }
+        KeyCode::Char('u') => {
+            let paths = picker.to_upload();
+            app.picker_start = picker.cwd.clone();
+            app.picker = None;
+            app.mode = Mode::Grid;
+            app.images_dirty = true;
+            queue_upload(app, &paths);
+        }
+        _ => {}
+    }
+    app.images_dirty = true;
+}
+
+/// Turns a set of chosen paths into a queue of files. A folder is walked; a single file is taken
 /// at its word, so a photograph with an extension imogen does not usually look for can
 /// still be sent by naming it.
-fn start_upload(app: &mut App, input: &str) {
-    let typed = input.trim();
-    if typed.is_empty() {
+fn queue_upload(app: &mut App, paths: &[PathBuf]) {
+    if paths.is_empty() {
         return;
     }
-    let path = expand(typed);
-    if !path.exists() {
-        app.note(format!("{} is not there.", path.display()));
-        return;
-    }
-
-    let files = match crate::commands::upload::collect(std::slice::from_ref(&path), true) {
+    let files = match crate::commands::upload::collect(paths, true) {
         Ok(files) => files,
         Err(error) => {
             app.note(error.to_string());
@@ -598,7 +737,7 @@ fn start_upload(app: &mut App, input: &str) {
         }
     };
     if files.is_empty() {
-        app.note(format!("Nothing to upload in {}.", path.display()));
+        app.note("Nothing to upload in that.");
         return;
     }
 

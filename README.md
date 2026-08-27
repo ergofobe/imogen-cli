@@ -183,16 +183,39 @@ With no arguments, imogen draws your library.
 | `/` | search |
 | `f` · `e` · `d` · `r` | favourite · archive · trash · restore |
 | `i` · `a` | details · albums |
-| `u` | upload a file or folder |
+| `u` | pick files to upload |
 | `1` `2` `3` `4` | library · favourites · archive · trash |
 | `g` `G` · `R` · `?` | first · last · reload · keys |
 
-`u` asks for a path. A folder is walked; a single file is taken at its word, so a
-photograph with an extension imogen does not usually look for can still be sent by naming
-it. `~` is expanded — there is no shell here to do it. Files go four at a time, the footer
-counts them off, and the grid reloads when the run ends so the new photographs appear where
-their dates put them rather than at the end. Upload while browsing an album and they are
-filed into it.
+### Picking files
+
+`u` opens a file picker rather than asking you to remember a path.
+
+```
+┌ ~/Pictures/cornwall ─────────────────┐┌──────────────────────┐
+│  nested/                             ││                      │
+│  notes.txt                     1.2 K ││   [ the photograph   │
+│✓ harbour.jpg                   2.4 M ││     under the        │
+│  cliff-path.jpg                3.1 M ││     cursor ]         │
+└──────────────────────────────────────┘└──────────────────────┘
+ 1 item  ·  space pick · enter open · u upload · esc back
+```
+
+The pane on the right draws whatever the cursor is on, so you can tell one `IMG_4471.JPG`
+from another without leaving the terminal. A file it cannot decode — a HEIC, a RAW — says
+so and notes that it will still upload; only the preview is missing, not the capability.
+
+`space` picks and unpicks, `enter` opens a folder or picks a file, `h` steps back out, `a`
+picks every photograph in the folder and `A` clears the lot. `.` shows hidden files, `~`
+goes home, `/` takes a typed path when you do know it, and `u` sends what is picked — or
+just what the cursor is on, if you picked nothing. `?` lists all of it. Nothing uploads
+until you press `u`, so `enter` one time too many costs you nothing.
+
+Folders are walked; a single file is taken at its word, so a photograph with an extension
+imogen does not usually look for can still be sent by naming it. Files go four at a time,
+the footer counts them off, and the grid reloads when the run ends so new photographs
+appear where their dates put them rather than at the end. Upload while browsing an album
+and they are filed into it.
 
 For anything with metadata to carry — a date, a place, a caption — use `imogen upload` from
 the shell instead: the browser sends the files and nothing else.

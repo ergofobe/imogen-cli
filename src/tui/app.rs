@@ -40,8 +40,10 @@ pub enum Mode {
     Search(String),
     Albums,
     Help,
-    /// Typing a path to upload. Applied on Enter, abandoned on Escape.
-    Upload(String),
+    /// Walking the filesystem to choose what to upload.
+    Picker,
+    /// Typing a path to jump the picker to. Escape abandons it.
+    PickerPath(String),
     /// Waiting for a yes or a no before doing something that cannot be undone.
     Confirm {
         prompt: String,
@@ -83,6 +85,17 @@ pub struct App {
     /// The picture shown in the viewer, which is a larger rendition than the grid's.
     pub preview: Option<(String, Arc<DynamicImage>)>,
 
+    /// The file picker, alive only while it is open.
+    pub picker: Option<crate::tui::picker::Picker>,
+    /// Where the picker last was, so reopening it does not start over at the top.
+    pub picker_start: PathBuf,
+    /// Locally decoded previews, keyed by path. `None` records a file that cannot be
+    /// shown, so it is not decoded again on every keypress.
+    pub local_previews: HashMap<PathBuf, Option<Arc<DynamicImage>>>,
+    pub local_wanted: HashSet<PathBuf>,
+    pub picker_list_area: Rect,
+    pub picker_preview_area: Rect,
+
     pub grid_area: Rect,
     pub tiles: Vec<Tile>,
     pub columns: usize,
@@ -99,6 +112,11 @@ pub struct App {
     pub upload_total: usize,
     /// What has landed, so it can be filed into the album being browsed once the run ends.
     pub uploaded_ids: Vec<String>,
+
+    /// Whether the keys overlay should describe the picker. Kept separate so neither
+    /// list is padded with keys that do nothing where you are — an overlay taller than
+    /// the window is worse than a short one.
+    pub help_shows_picker: bool,
 
     pub status: Option<String>,
     pub loading: bool,
@@ -129,12 +147,19 @@ impl App {
             columns: 1,
             tile_width: 20,
             tile_height: 9,
+            picker: None,
+            picker_start: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            local_previews: HashMap::new(),
+            local_wanted: HashSet::new(),
+            picker_list_area: Rect::default(),
+            picker_preview_area: Rect::default(),
             upload_queue: VecDeque::new(),
             upload_inflight: 0,
             upload_done: 0,
             upload_failed: 0,
             upload_total: 0,
             uploaded_ids: Vec::new(),
+            help_shows_picker: false,
             status: None,
             loading: false,
             images_dirty: true,

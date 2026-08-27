@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::output;
 use crate::tui::app::{App, Mode, Tile};
@@ -42,6 +43,22 @@ pub fn layout(app: &mut App, area: Rect) {
 
     app.grid_area = content;
     app.tiles.clear();
+
+    if matches!(app.mode, Mode::Picker | Mode::PickerPath(_)) {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(52), Constraint::Min(20)])
+            .split(body);
+        app.picker_list_area = split[0];
+        // One cell of border all round the preview pane.
+        app.picker_preview_area = Rect {
+            x: split[1].x + 1,
+            y: split[1].y + 1,
+            width: split[1].width.saturating_sub(2),
+            height: split[1].height.saturating_sub(2),
+        };
+        return;
+    }
 
     if app.mode == Mode::Viewer {
         if let Some(asset) = app.selected_asset() {
@@ -105,8 +122,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_footer(frame, app, chunks[2]);
 
     match &app.mode {
+        Mode::Picker | Mode::PickerPath(_) => draw_picker(frame, app),
         Mode::Albums => draw_albums(frame, app, chunks[1]),
-        Mode::Help => draw_help(frame, chunks[1]),
+        Mode::Help => draw_help(frame, chunks[1], app.help_shows_picker),
         Mode::Viewer => draw_viewer(frame, app, chunks[1]),
         _ => {
             draw_grid(frame, app);
@@ -162,7 +180,19 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.mode {
         Mode::Search(input) => format!(" search: {input}▏"),
-        Mode::Upload(input) => format!(" upload (file or folder): {input}▏"),
+        Mode::PickerPath(input) => format!(" go to: {input}▏"),
+        Mode::Picker => {
+            let picker = app.picker.as_ref();
+            let chosen = picker.map(|p| p.chosen.len()).unwrap_or(0);
+            format!(
+                " {}  ·  space pick · enter open · u upload · esc back",
+                if chosen == 0 {
+                    "nothing picked".to_string()
+                } else {
+                    output::plural(chosen, "item")
+                }
+            )
+        }
         Mode::Confirm { prompt, .. } => format!(" {prompt}  [y/N]"),
         // A run in progress outranks whatever the last message was: it is the only thing
         // on screen that is still changing.
@@ -192,18 +222,26 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let style = match &app.mode {
-        Mode::Search(_) | Mode::Upload(_) => Style::default().fg(ACCENT),
+        Mode::Search(_) | Mode::PickerPath(_) => Style::default().fg(ACCENT),
+        Mode::Picker => Style::default().fg(MUTED),
         Mode::Confirm { .. } => Style::default().fg(Color::Rgb(0xE0, 0x7A, 0x5F)),
         _ if app.uploading() => Style::default().fg(ACCENT),
         _ => Style::default().fg(MUTED),
     };
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+    // The hint is right-aligned over the same row, so the left text is cut to fit rather
+    // than being drawn underneath it.
+    const HINT: &str = "? help  q quit ";
+    let room = (area.width as usize).saturating_sub(HINT.width());
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "? help  q quit ",
-            Style::default().fg(MUTED),
-        )))
-        .alignment(Alignment::Right),
+            output::truncate(&text, room),
+            style,
+        ))),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(HINT, Style::default().fg(MUTED))))
+            .alignment(Alignment::Right),
         area,
     );
 }
@@ -311,6 +349,134 @@ fn draw_viewer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.picker.as_ref() else {
+        return;
+    };
+
+    let items: Vec<ListItem> = picker
+        .entries
+        .iter()
+        .map(|entry| {
+            let ticked = picker.is_chosen(entry);
+            let name = if entry.is_dir {
+                format!("{}/", entry.name)
+            } else {
+                entry.name.clone()
+            };
+            let style = if entry.is_dir {
+                Style::default().fg(ACCENT)
+            } else if entry.is_media {
+                Style::default().fg(Color::White)
+            } else {
+                // Not something imogen usually stores. Still choosable, but not offered.
+                Style::default().fg(MUTED)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if ticked { "✓ " } else { "  " },
+                    Style::default().fg(if ticked { ACCENT } else { MUTED }),
+                ),
+                Span::styled(format!("{:<38}", output::truncate(&name, 38)), style),
+                Span::styled(
+                    if entry.is_dir {
+                        String::new()
+                    } else {
+                        format!("{:>9}", output::bytes(entry.size))
+                    },
+                    Style::default().fg(MUTED),
+                ),
+            ]))
+        })
+        .collect();
+
+    let here = compress_home(&picker.cwd);
+    let mut state = ListState::default();
+    state.select(Some(picker.cursor));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32)))
+                    .title(Span::styled(
+                        format!(" {} ", output::truncate_left(&here, 46)),
+                        Style::default().fg(ACCENT),
+                    )),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol(""),
+        app.picker_list_area,
+        &mut state,
+    );
+
+    let pane = Rect {
+        x: app.picker_preview_area.x.saturating_sub(1),
+        y: app.picker_preview_area.y.saturating_sub(1),
+        width: app.picker_preview_area.width + 2,
+        height: app.picker_preview_area.height + 2,
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32))),
+        pane,
+    );
+
+    // The picture itself is placed after this frame is drawn. What goes here is only what
+    // to say when there will not be one.
+    let message = match picker.current() {
+        _ if picker.error.is_some() => picker.error.clone(),
+        Some(entry) if entry.is_dir => Some(format!("{}/", entry.name)),
+        Some(entry) if !crate::tui::picker::is_previewable(&entry.path) => Some(format!(
+            "{}
+
+no preview — it will still upload",
+            entry.name
+        )),
+        Some(entry) => match app.local_previews.get(&entry.path) {
+            Some(Some(_)) => None,
+            Some(None) => Some(format!(
+                "{}
+
+could not read it",
+                entry.name
+            )),
+            None => Some("…".to_string()),
+        },
+        None => Some("empty".to_string()),
+    };
+    if let Some(message) = message {
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(MUTED))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            centred(
+                app.picker_preview_area,
+                app.picker_preview_area.width.saturating_sub(2),
+                5,
+            ),
+        );
+    }
+}
+
+/// `~/Pictures` rather than the whole path, which is how somebody would say it.
+fn compress_home(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    match dirs::home_dir() {
+        Some(home) => {
+            let home = home.display().to_string();
+            match text.strip_prefix(&home) {
+                Some("") => "~".to_string(),
+                Some(rest) => format!("~{rest}"),
+                None => text,
+            }
+        }
+        None => text,
+    }
+}
+
 fn draw_albums(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .albums
@@ -408,8 +574,8 @@ fn field<'a>(key: &'a str, value: &str) -> Line<'a> {
     ])
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let rows = [
+fn draw_help(frame: &mut Frame, area: Rect, picking: bool) {
+    let browsing = [
         ("↑ ↓ ← →  h j k l", "move"),
         ("enter", "look at it"),
         ("escape", "back"),
@@ -420,13 +586,26 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("r", "restore from the trash"),
         ("i", "details"),
         ("a", "albums"),
-        ("u", "upload a file or folder"),
+        ("u", "pick files to upload"),
         ("1 2 3 4", "library · favourites · archive · trash"),
         ("g  G", "first · last"),
         ("R", "reload"),
         ("?", "this"),
         ("q", "quit"),
     ];
+    let picking_keys = [
+        ("↑ ↓  k j", "move"),
+        ("space", "pick, or unpick"),
+        ("enter  l  →", "open a folder · pick a file"),
+        ("h  ←  backspace", "back up a folder"),
+        ("a  A", "pick every photo here · pick none"),
+        (".", "show hidden files"),
+        ("~", "go home"),
+        ("/", "go to a path"),
+        ("u", "upload what is picked"),
+        ("escape", "back to the library"),
+    ];
+    let rows: &[(&str, &str)] = if picking { &picking_keys } else { &browsing };
     let lines: Vec<Line> = rows
         .iter()
         .map(|(keys, what)| {
@@ -437,14 +616,21 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let area = centred(area, 52, lines.len() as u16 + 2);
+    let area = centred(area, 64, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
-                .title(Span::styled(" keys ", Style::default().fg(ACCENT))),
+                .title(Span::styled(
+                    if picking {
+                        " keys · picking files "
+                    } else {
+                        " keys "
+                    },
+                    Style::default().fg(ACCENT),
+                )),
         ),
         area,
     );
@@ -458,5 +644,157 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height - height) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::picker::Picker;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Renders a frame and flattens it to text, so an assertion can say what somebody
+    /// would actually see. Screen-scraping a real terminal cannot: ratatui writes only the
+    /// cells that changed, so "1 item" becoming "2 items" never crosses the wire as a
+    /// whole string.
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        layout(app, Rect::new(0, 0, width, height));
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("photo-a.jpg"), b"x").unwrap();
+        std::fs::write(dir.path().join("photo-b.jpg"), b"x").unwrap();
+        dir
+    }
+
+    fn picking(dir: &std::path::Path) -> App {
+        let mut app = App::new();
+        app.picker = Some(Picker::open(dir));
+        app.mode = Mode::Picker;
+        app
+    }
+
+    /// Not an assertion — prints the screen so a change to the layout can be looked at.
+    #[test]
+    #[ignore = "for looking at, not for CI"]
+    fn show() {
+        let dir = fixture();
+        let mut app = picking(dir.path());
+        app.picker.as_mut().unwrap().move_by(2);
+        app.picker.as_mut().unwrap().toggle();
+        app.picker.as_mut().unwrap().move_by(1);
+        println!("{}", render(&mut app, 100, 20));
+        app.help_shows_picker = true;
+        app.mode = Mode::Help;
+        println!("\n{}", render(&mut app, 100, 24));
+        app.help_shows_picker = false;
+        println!("\n{}", render(&mut app, 100, 24));
+    }
+
+    #[test]
+    fn the_picker_lists_folders_first_and_marks_what_is_not_media() {
+        let dir = fixture();
+        let mut app = picking(dir.path());
+        let screen = render(&mut app, 100, 20);
+        let listed: Vec<&str> = screen
+            .lines()
+            .filter(|l| l.contains("nested") || l.contains("notes") || l.contains("photo-"))
+            .collect();
+        assert!(
+            listed[0].contains("nested/"),
+            "folders come first: {listed:?}"
+        );
+        assert!(screen.contains("photo-a.jpg"));
+        assert!(screen.contains("notes.txt"));
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_drawn_says_so_and_says_it_will_still_upload() {
+        let dir = fixture();
+        let mut app = picking(dir.path());
+        // nested/, notes.txt, photo-a.jpg, photo-b.jpg — one step down is the text file.
+        app.picker.as_mut().unwrap().move_by(1);
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("no preview"), "{screen}");
+        // Whether it wraps depends on the width; what matters is that both halves of the
+        // reassurance are on screen somewhere.
+        assert!(
+            screen.contains("still") && screen.contains("upload"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_footer_counts_what_has_been_picked() {
+        let dir = fixture();
+        let mut app = picking(dir.path());
+        assert!(render(&mut app, 100, 20).contains("nothing picked"));
+
+        // Ticking does not move the cursor — the key handler does that — so picking a
+        // second file means stepping onto it first.
+        let picker = app.picker.as_mut().unwrap();
+        picker.move_by(2);
+        picker.toggle();
+        assert!(render(&mut app, 100, 20).contains("1 item"));
+
+        let picker = app.picker.as_mut().unwrap();
+        picker.move_by(1);
+        picker.toggle();
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("2 items"), "{screen}");
+
+        // And ticking the same file again takes it back off.
+        app.picker.as_mut().unwrap().toggle();
+        assert!(render(&mut app, 100, 20).contains("1 item"));
+    }
+
+    #[test]
+    fn the_folder_being_looked_at_is_named_the_way_a_person_would_say_it() {
+        let dir = fixture();
+        let mut app = picking(dir.path());
+        let name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(render(&mut app, 100, 20).contains(&name));
+    }
+
+    #[test]
+    fn an_upload_in_progress_outranks_the_last_message() {
+        let mut app = App::new();
+        app.note("something that happened earlier");
+        app.upload_total = 12;
+        app.upload_done = 7;
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("uploading 7/12"), "{screen}");
+        assert!(!screen.contains("something that happened"));
+    }
+
+    #[test]
+    fn a_failure_during_a_run_is_counted_where_it_can_be_seen() {
+        let mut app = App::new();
+        app.upload_total = 5;
+        app.upload_done = 3;
+        app.upload_failed = 1;
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("uploading 4/5"), "{screen}");
+        assert!(screen.contains("1 failed"), "{screen}");
     }
 }
