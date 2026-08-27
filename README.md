@@ -268,6 +268,33 @@ imogen --json upload --manifest - --report /tmp/done.jsonl < manifest.jsonl
 | `IMOGEN_NO_IMAGES` | Draw no pictures at all |
 | `NO_COLOR` | Colour off, as everywhere else |
 
+## Installing
+
+Every tagged release carries binaries for Linux and macOS, built by
+[the release workflow](.github/workflows/release.yml).
+
+**Linux** — `.deb`, `.rpm`, or a tarball. The binaries are statically linked against musl,
+so one build runs on any distribution regardless of its glibc.
+
+```bash
+sudo dpkg -i imogen-cli_*_amd64.deb          # Debian, Ubuntu
+sudo rpm -i imogen-cli-*.x86_64.rpm          # Fedora, RHEL, openSUSE
+```
+
+**macOS** — a tarball per architecture, and a universal one that runs on both.
+
+```bash
+tar -xzf imogen-universal-apple-darwin.tar.gz
+cd imogen-universal-apple-darwin && ./install.sh
+```
+
+`install.sh` puts the binary in `~/.local/bin` and the completions and man page beside it;
+set `PREFIX` to put them somewhere else. The packages carry the same things, in the places
+a shell and `man` already look — so `imogen <tab>` and `man imogen` work after installing.
+
+Nothing is signed or notarised, so macOS will want the quarantine attribute cleared:
+`xattr -d com.apple.quarantine imogen`.
+
 ## Building
 
 ```bash

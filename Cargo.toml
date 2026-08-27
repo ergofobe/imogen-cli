@@ -47,3 +47,40 @@ tempfile = "3"
 # `imogen ls | head` into a panic instead of a quiet exit.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# --- packaging -------------------------------------------------------------
+#
+# The completions and the man page are generated into `dist/` by the release
+# workflow before either packager runs; both are listed here so a `.deb` and an
+# `.rpm` install them in the places a shell and `man` already look.
+
+[package.metadata.deb]
+# A GitHub noreply address rather than anybody's own: this ends up in a public
+# package's control file. Change it if the project would rather be reachable.
+maintainer = "ergofobe <ergofobe@users.noreply.github.com>"
+copyright = "The imogen authors"
+license-file = ["LICENSE", "0"]
+extended-description = """A client for an imogen photo library. Search it, upload to it, download from it, edit what a photograph says about itself, and administer the server — from a shell, from a script, or from an agent. Run with no arguments for a terminal browser that draws photographs using the Kitty graphics protocol."""
+section = "graphics"
+priority = "optional"
+assets = [
+  ["target/release/imogen", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/imogen-cli/README.md", "644"],
+  ["dist/completions/imogen.bash", "usr/share/bash-completion/completions/imogen", "644"],
+  ["dist/completions/imogen.fish", "usr/share/fish/vendor_completions.d/imogen.fish", "644"],
+  ["dist/completions/_imogen", "usr/share/zsh/vendor-completions/_imogen", "644"],
+  ["dist/man/imogen.1", "usr/share/man/man1/imogen.1", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Command-line client and terminal browser for the imogen photo library"
+license = "AGPLv3+"
+assets = [
+  { source = "target/release/imogen", dest = "/usr/bin/imogen", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/imogen-cli/README.md", mode = "644", doc = true },
+  { source = "LICENSE", dest = "/usr/share/doc/imogen-cli/LICENSE", mode = "644", doc = true },
+  { source = "dist/completions/imogen.bash", dest = "/usr/share/bash-completion/completions/imogen", mode = "644" },
+  { source = "dist/completions/imogen.fish", dest = "/usr/share/fish/vendor_completions.d/imogen.fish", mode = "644" },
+  { source = "dist/completions/_imogen", dest = "/usr/share/zsh/site-functions/_imogen", mode = "644" },
+  { source = "dist/man/imogen.1", dest = "/usr/share/man/man1/imogen.1", mode = "644", doc = true },
+]

@@ -1,0 +1,176 @@
+name: Release
+
+# Tag a version and the binaries build themselves. `workflow_dispatch` does the same work
+# without publishing anything, so the packaging can be exercised before a tag exists.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      sdk_ref:
+        description: 'imogen-sdk ref to build against'
+        default: 'main'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: linux · ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: ergofobe/imogen-sdk
+          # A path dependency, not a crates.io one, so a release is built against a
+          # named ref of it. A tag build takes main; a dispatch may say otherwise.
+          ref: ${{ inputs.sdk_ref || 'main' }}
+          path: imogen-sdk-checkout
+      - name: Put the SDK where Cargo expects it
+        run: mv imogen-sdk-checkout ../imogen-sdk
+
+      # musl, so one binary runs on any distribution rather than on whichever glibc the
+      # runner happened to have. Nothing here links OpenSSL — TLS is rustls — so a fully
+      # static build needs no system libraries at all.
+      - name: Install the musl toolchain
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Confirm it is actually static
+        run: |
+          binary=target/${{ matrix.target }}/release/imogen
+          file "$binary"
+          # A dynamically linked binary lists its libraries as `libfoo.so => /path`. A
+          # static one says "not a dynamic executable" or "statically linked" and lists
+          # nothing, so the arrow is the thing to look for — matching on the wording of
+          # the negative answer differs between ldd versions.
+          if ldd "$binary" 2>&1 | grep -q '=>'; then
+            echo "::error::$binary is dynamically linked; a musl build should not be"
+            ldd "$binary" || true
+            exit 1
+          fi
+
+      - name: Generate completions and a man page
+        run: ./.github/scripts/extras.sh target/${{ matrix.target }}/release/imogen
+
+      - name: Tarball
+        run: ./.github/scripts/tarball.sh ${{ matrix.target }} imogen-${{ matrix.target }}
+
+      # Both packagers rewrite the `target/release/...` asset paths in Cargo.toml to
+      # `target/<triple>/release/...` when given --target, so the binary is read straight
+      # from where cargo put it. --no-build because it is already built, and --no-strip
+      # because the release profile has not asked for symbols to be kept anyway.
+      - name: Build a .deb and an .rpm
+        run: |
+          cargo install --locked cargo-deb cargo-generate-rpm
+          cargo deb --no-build --no-strip --target ${{ matrix.target }} --output dist/
+          cargo generate-rpm --target ${{ matrix.target }} --output dist/
+
+      # One glob per line: upload-artifact matches with @actions/glob, which has no brace
+      # expansion, so `*.{tar.gz,deb}` silently matches nothing.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+
+  macos:
+    name: macos · universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: ergofobe/imogen-sdk
+          # A path dependency, not a crates.io one, so a release is built against a
+          # named ref of it. A tag build takes main; a dispatch may say otherwise.
+          ref: ${{ inputs.sdk_ref || 'main' }}
+          path: imogen-sdk-checkout
+      - name: Put the SDK where Cargo expects it
+        run: mv imogen-sdk-checkout ../imogen-sdk
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      # Both architectures are built on the one runner: Xcode ships both SDKs, so an
+      # Apple-to-Apple cross build needs nothing extra.
+      - name: Build for both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Generate completions and a man page
+        run: ./.github/scripts/extras.sh target/aarch64-apple-darwin/release/imogen
+
+      - name: Tarballs, per architecture and universal
+        run: |
+          ./.github/scripts/tarball.sh aarch64-apple-darwin imogen-aarch64-apple-darwin
+          ./.github/scripts/tarball.sh x86_64-apple-darwin imogen-x86_64-apple-darwin
+          # One binary that runs on both, for anyone who would rather not choose.
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/imogen \
+            target/aarch64-apple-darwin/release/imogen \
+            target/x86_64-apple-darwin/release/imogen
+          lipo -info target/universal-apple-darwin/release/imogen
+          ./.github/scripts/tarball.sh universal-apple-darwin imogen-universal-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    # Only a tag publishes. A dispatch run builds everything and stops, so the packaging
+    # can be exercised without inventing a release to throw away.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Gather and checksum
+        run: |
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \) \
+            -exec mv {} dist/ \;
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

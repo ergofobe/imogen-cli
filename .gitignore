@@ -2,3 +2,5 @@
 **/*.rs.bk
 Cargo.lock.orig
 .DS_Store
+# Release artifacts, built by .github/scripts.
+/dist
