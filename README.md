@@ -169,23 +169,43 @@ With no arguments, imogen draws your library.
 
 ```
 ┌ imogen · library ────────────────────────── 12,431 photographs ─┐
-│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐                 │
-│  │ photo  │  │ photo  │  │ photo  │  │ photo  │                 │
-│  │2019-07 │  │2019-07 │  │2019-07★│  │2019-07 │                 │
-│  └────────┘  └────────┘  └────────┘  └────────┘                 │
+│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐            2024 │
+│  │ photo  │  │ photo  │  │ photo  │  │ photo  │            2022 │
+│  │2019-07 │  │2019-07 │  │2019-07★│  │2019-07 │           ›2019 │
+│  └────────┘  └────────┘  └────────┘  └────────┘            2016 │
 └ harbour.jpg · 2019-07-14 · 2.4 MiB ★        ? help  q quit ─────┘
 ```
+
+The rail down the right edge is the whole library, however many years of it there are, with
+`›` marking where you are. imogen holds the stretch you are looking at rather than
+everything you have scrolled past, so the far end costs the same as the near one.
 
 | | |
 |---|---|
 | `↑ ↓ ← →` `h j k l` | move |
 | `enter` · `escape` | look at it · back |
 | `/` | search |
+| `g` | jump to a date |
+| `[` · `]` | a year older · a year newer |
+| `home` · `end` | first · last |
 | `f` · `e` · `d` · `r` | favourite · archive · trash · restore |
 | `i` · `a` | details · albums |
 | `u` | pick files to upload |
 | `1` `2` `3` `4` | library · favourites · archive · trash |
-| `g` `G` · `R` · `?` | first · last · reload · keys |
+| `R` · `?` | reload · keys |
+
+### Going to a date
+
+`g` asks where you want to be, and takes the same vocabulary as `--after` does, plus month
+names:
+
+```
+ jump to: aug 2011▏
+```
+
+`2011`, `aug 2011`, `august 2011` and `2011-08-14` all work. If the day you name has no
+photographs — and on a library of any age most days do not — it lands on the nearest day
+that does, however many years away that is, and says where it put you.
 
 ### Picking files
 

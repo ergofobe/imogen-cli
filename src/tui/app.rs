@@ -115,6 +115,12 @@ pub struct App {
     pub window: TileWindow,
     /// What the viewport wanted last pass, so the window is only rebuilt when it moves.
     pub held: Vec<String>,
+    /// Which set of results is the current one. Every request is stamped with the epoch it
+    /// was issued under, and an answer that arrives after a reload carries a stale stamp.
+    /// Nothing drains the in-flight requests when the scope changes, so without this a
+    /// bucket fetched under the library's filter can be filed under the trash's spine —
+    /// the wrong photographs, at plausible indices, with nothing on screen to say so.
+    pub epoch: u64,
     /// The full record of the selected photograph — everything a tile deliberately does
     /// not carry. Fetched when the viewer or the details panel needs it, not per keypress.
     pub detail: Option<Asset>,
@@ -201,6 +207,7 @@ impl App {
             period_inflight: HashSet::new(),
             window: TileWindow::default(),
             held: Vec::new(),
+            epoch: 0,
             detail: None,
             detail_asked: None,
             selected: 0,
@@ -279,6 +286,8 @@ impl App {
     /// Forgets the current results without forgetting the pictures already decoded: the
     /// same photograph in a different scope does not need fetching twice.
     pub fn reset_results(&mut self) {
+        // Everything already asked for belongs to the results being thrown away.
+        self.epoch = self.epoch.wrapping_add(1);
         self.buckets.clear();
         self.total = 0;
         self.periods.clear();
@@ -672,8 +681,13 @@ impl App {
     /// scroll. And a thumbnail the grid is drawing right now is never the one chosen,
     /// because evicting what is on screen is a hole that refills only to be evicted again.
     pub fn remember_thumbnail(&mut self, id: String) {
-        // Looking at it again buys it time, rather than leaving it where it first landed.
-        self.thumb_order.retain(|held| *held != id);
+        // Arrival order, exactly as `preview_order` is, and for a grid that is already
+        // recency: thumbnails are fetched as they scroll into view, so the order they
+        // arrived in and the order they were last wanted in are the same order. An id
+        // already held keeps its place rather than gaining a second one.
+        if self.thumb_order.contains(&id) {
+            return;
+        }
         self.thumb_order.push_back(id);
 
         let on_screen: HashSet<String> = self.visible_ids().into_iter().collect();

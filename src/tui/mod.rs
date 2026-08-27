@@ -41,11 +41,12 @@ enum Loaded {
     Thumbnail(String, Result<Vec<u8>>),
     Preview(String, Result<Vec<u8>>),
     /// The shape of the whole library: one entry a day. Small enough to hold for twenty
-    /// years, which is the whole point of it.
-    Spine(Result<Vec<imogen_sdk::TimelineBucket>>),
+    /// years, which is the whole point of it. Carries the epoch it was asked under.
+    Spine(u64, Result<Vec<imogen_sdk::TimelineBucket>>),
     /// One `YYYY-MM` of tiles, named so a slow answer is filed under the period it was
-    /// asked for rather than under wherever the viewport has since moved.
-    Bucket(String, Result<imogen_sdk::TilePage>),
+    /// asked for rather than under wherever the viewport has since moved, and stamped so
+    /// an answer for results that no longer exist is dropped rather than believed.
+    Bucket(u64, String, Result<imogen_sdk::TilePage>),
     Albums(Result<Vec<imogen_sdk::Album>>),
     /// Boxed: an upload result carries a whole `Asset`, which would otherwise make
     /// every variant of this enum as large as the largest one.
@@ -98,7 +99,7 @@ async fn event_loop(ctx: &Context) -> Result<()> {
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut work: FuturesUnordered<Job<'_>> = FuturesUnordered::new();
 
-    work.push(Box::pin(load_spine(ctx, spine_query(&app))));
+    work.push(Box::pin(load_spine(ctx, spine_query(&app), app.epoch)));
     app.loading = true;
     work.push(Box::pin(load_albums(ctx)));
 
@@ -139,6 +140,7 @@ async fn event_loop(ctx: &Context) -> Result<()> {
                 work.push(Box::pin(load_bucket(
                     ctx,
                     bucket_query(period, &app, cursor),
+                    app.epoch,
                 )));
             }
         }
@@ -242,8 +244,9 @@ fn bucket_query(period: &str, app: &App, cursor: Option<String>) -> TimelineBuck
     }
 }
 
-async fn load_spine(ctx: &Context, query: TimelineQuery) -> Loaded {
+async fn load_spine(ctx: &Context, query: TimelineQuery, epoch: u64) -> Loaded {
     Loaded::Spine(
+        epoch,
         ctx.client
             .assets
             .timeline(&query)
@@ -253,7 +256,7 @@ async fn load_spine(ctx: &Context, query: TimelineQuery) -> Loaded {
     )
 }
 
-async fn load_bucket(ctx: &Context, query: TimelineBucketQuery) -> Loaded {
+async fn load_bucket(ctx: &Context, query: TimelineBucketQuery, epoch: u64) -> Loaded {
     let period = query.period.clone();
     let page = ctx
         .client
@@ -261,7 +264,7 @@ async fn load_bucket(ctx: &Context, query: TimelineBucketQuery) -> Loaded {
         .timeline_bucket(&query)
         .await
         .map_err(Into::into);
-    Loaded::Bucket(period, page)
+    Loaded::Bucket(epoch, period, page)
 }
 
 async fn load_asset(ctx: &Context, id: String) -> Loaded {
@@ -431,7 +434,10 @@ fn absorb(app: &mut App, loaded: Loaded) {
             app.preview_inflight.remove(&id);
             app.note(format!("Could not load: {error}"));
         }
-        Loaded::Spine(Ok(buckets)) => {
+        // A spine for results that have been thrown away is dropped whole. Not even
+        // `loading` is cleared by it: the spine that replaced it is still on its way.
+        Loaded::Spine(epoch, _) if epoch != app.epoch => {}
+        Loaded::Spine(_, Ok(buckets)) => {
             app.loading = false;
             app.buckets = buckets;
             app.recount();
@@ -441,11 +447,16 @@ fn absorb(app: &mut App, loaded: Loaded) {
             app.rebuild_window();
             app.images_dirty = true;
         }
-        Loaded::Spine(Err(error)) => {
+        Loaded::Spine(_, Err(error)) => {
             app.loading = false;
             app.note(format!("Could not load the timeline: {error}"));
         }
-        Loaded::Bucket(period, Ok(page)) => {
+        // Tiles fetched under a filter that is no longer the one on screen. Dropped before
+        // anything is touched — clearing the in-flight mark here would cancel the request
+        // the *current* results have out for the same period, and then the correct tiles
+        // would never arrive either, because a period held whole is never asked for again.
+        Loaded::Bucket(epoch, _, _) if epoch != app.epoch => {}
+        Loaded::Bucket(_, period, Ok(page)) => {
             app.period_inflight.remove(&period);
             match page.next_cursor {
                 Some(cursor) => {
@@ -459,7 +470,7 @@ fn absorb(app: &mut App, loaded: Loaded) {
             app.rebuild_window();
             app.images_dirty = true;
         }
-        Loaded::Bucket(period, Err(error)) => {
+        Loaded::Bucket(_, period, Err(error)) => {
             app.period_inflight.remove(&period);
             app.note(format!("Could not load photographs: {error}"));
         }
@@ -957,7 +968,7 @@ fn reload<'a>(ctx: &'a Context, app: &mut App, work: &mut FuturesUnordered<Job<'
     app.reset_results();
     app.wanted.clear();
     app.loading = true;
-    work.push(Box::pin(load_spine(ctx, spine_query(app))));
+    work.push(Box::pin(load_spine(ctx, spine_query(app), app.epoch)));
 }
 
 /// Puts the cursor on the day somebody typed, or on the nearest day that has photographs
@@ -1176,6 +1187,18 @@ mod tests {
             !app.wanted.contains("asset-0"),
             "and so must be asked for again rather than left blank for ever"
         );
+    }
+
+    /// The cache is keyed once per photograph. Remembering one twice must not put two
+    /// entries in the order, which would evict something else to make room for a duplicate.
+    #[test]
+    fn remembering_the_same_thumbnail_twice_does_not_grow_the_order() {
+        let mut app = viewing(&[]);
+        app.thumbnails.insert("a".into(), Arc::new(test_image()));
+        app.remember_thumbnail("a".into());
+        app.remember_thumbnail("a".into());
+        assert_eq!(app.thumb_order.len(), 1);
+        assert_eq!(app.thumbnails.len(), 1);
     }
 
     #[test]
@@ -1453,6 +1476,7 @@ mod tests {
     /// One pass of the event loop's window management, without the network: settle the
     /// window on where the viewport is, and answer every period it asks for.
     fn pass(app: &mut App, served: &mut usize) {
+        let epoch = app.epoch;
         let periods = app.periods_for_viewport();
         if periods != app.held {
             app.held = periods.clone();
@@ -1474,6 +1498,7 @@ mod tests {
             absorb(
                 app,
                 Loaded::Bucket(
+                    epoch,
                     period.clone(),
                     Ok(imogen_sdk::TilePage {
                         items: (start..start + count)
@@ -1554,9 +1579,13 @@ mod tests {
         app.grid_area = Rect::new(0, 0, 80, 27);
         assert!(app.periods_for_viewport().is_empty(), "nothing known yet");
 
+        let epoch = app.epoch;
         absorb(
             &mut app,
-            Loaded::Spine(Ok(vec![bucket("2024-06-01", 40), bucket("2009-03-01", 40)])),
+            Loaded::Spine(
+                epoch,
+                Ok(vec![bucket("2024-06-01", 40), bucket("2009-03-01", 40)]),
+            ),
         );
         assert_eq!(app.total, 80);
         assert!(!app.loading);
@@ -1577,9 +1606,13 @@ mod tests {
         assert_eq!(app.window.base, 0);
 
         // Something older arrived, so June is no longer at the top of the library.
+        let epoch = app.epoch;
         absorb(
             &mut app,
-            Loaded::Spine(Ok(vec![bucket("2024-07-01", 10), bucket("2024-06-01", 40)])),
+            Loaded::Spine(
+                epoch,
+                Ok(vec![bucket("2024-07-01", 10), bucket("2024-06-01", 40)]),
+            ),
         );
         assert_eq!(
             app.window.base, 10,
@@ -1617,6 +1650,108 @@ mod tests {
         assert_eq!(detail_wanted(&mut app), None);
         app.show_info = true;
         assert_eq!(detail_wanted(&mut app).as_deref(), Some("a"));
+    }
+
+    /// A page of tiles as the server would answer for one period.
+    fn page(ids: &[&str]) -> imogen_sdk::TilePage {
+        imogen_sdk::TilePage {
+            items: ids
+                .iter()
+                .map(|id| tile(id, "2011-08-14T00:00:00.000Z"))
+                .collect(),
+            next_cursor: None,
+            total: None,
+        }
+    }
+
+    /// Nothing drains the in-flight requests when the scope changes, so an answer fetched
+    /// under the library's filter can land after the trash's spine has replaced it. Filed,
+    /// it would put library photographs at trash indices — the wrong pictures, at plausible
+    /// places, with nothing on screen to say so. That is the one outcome a photo library
+    /// must not have.
+    #[test]
+    fn a_bucket_fetched_under_the_old_scope_is_dropped_not_shown() {
+        let mut app = App::new();
+        app.buckets = vec![bucket("2011-08-14", 2)];
+        app.recount();
+        let stale = app.epoch;
+        app.period_inflight.insert("2011-08".into());
+
+        // The scope changes: results thrown away, a new spine asked for and arrived.
+        app.reset_results();
+        assert_ne!(app.epoch, stale, "a reload is a new set of results");
+        app.scope = Scope::Trash;
+        let now = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Spine(now, Ok(vec![bucket("2011-08-14", 2)])),
+        );
+        // The current results have their own request out for the same period.
+        app.period_inflight.insert("2011-08".into());
+
+        // Now the library's answer turns up.
+        absorb(
+            &mut app,
+            Loaded::Bucket(
+                stale,
+                "2011-08".into(),
+                Ok(page(&["library-a", "library-b"])),
+            ),
+        );
+
+        assert!(
+            app.periods.is_empty(),
+            "the wrong scope's tiles must not be filed"
+        );
+        assert!(
+            app.window.tiles.is_empty(),
+            "and so must not be placed in the window"
+        );
+        // And the mark for the request the *current* results have out is untouched — else
+        // the right tiles would never arrive either, because a period held whole is never
+        // asked for a second time.
+        assert!(app.period_inflight.contains("2011-08"));
+        assert_eq!(app.period_wanted("2011-08"), None, "still in flight");
+
+        // The current scope's own answer is filed as normal.
+        let now = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Bucket(now, "2011-08".into(), Ok(page(&["trash-a", "trash-b"]))),
+        );
+        assert_eq!(
+            app.window.get(0).map(|tile| tile.id.as_str()),
+            Some("trash-a")
+        );
+    }
+
+    /// The same for the spine. A stale one must not even clear `loading`: the spine that
+    /// replaced it has not arrived yet, and saying otherwise reads as a finished load.
+    #[test]
+    fn a_spine_for_results_that_were_thrown_away_is_dropped_whole() {
+        let mut app = App::new();
+        let stale = app.epoch;
+        app.reset_results();
+        app.loading = true;
+
+        absorb(
+            &mut app,
+            Loaded::Spine(stale, Ok(vec![bucket("2011-08-14", 500)])),
+        );
+        assert_eq!(app.total, 0, "the old library's shape must not be adopted");
+        assert!(app.buckets.is_empty());
+        assert!(
+            app.loading,
+            "the spine that replaced it is still on its way"
+        );
+
+        let now = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Spine(now, Ok(vec![bucket("2011-08-14", 2)])),
+        );
+        assert_eq!(app.total, 2);
+        assert!(!app.loading);
     }
 
     /// The reported bug, through the real request decision and the real absorb: view one,

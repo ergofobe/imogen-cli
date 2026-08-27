@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::cli::{EditArgs, ListArgs, RestoreArgs, SearchArgs, ShowArgs, TrashArgs};
 use crate::context::Context;
+use crate::dates;
 use crate::output::{self, GREEN, RED, YELLOW};
 
 pub async fn list(ctx: &Context, args: &ListArgs) -> Result<()> {
@@ -288,18 +289,45 @@ pub async fn stats(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// The days inside a pair of bounds, widened the way every other filter widens them.
+///
+/// A bucket's date is a whole day, and a bound may be less than one: `--before 2011` means
+/// the end of 2011, not the string "2011". Compared raw, `"2011-08-15" <= "2011"` is false
+/// and the command answers with nothing — it hid whole years in silence, which on a
+/// twenty-year library is the one answer that looks like a working command.
+fn within(
+    buckets: Vec<imogen_sdk::TimelineBucket>,
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Vec<imogen_sdk::TimelineBucket> {
+    let from = after.map(|bound| day_of(&dates::to_start_of_day(bound)));
+    let until = before.map(|bound| day_of(&dates::to_end_of_day(bound)));
+    buckets
+        .into_iter()
+        .filter(|bucket| {
+            from.as_deref()
+                .is_none_or(|from| bucket.date.as_str() >= from)
+        })
+        .filter(|bucket| {
+            until
+                .as_deref()
+                .is_none_or(|until| bucket.date.as_str() <= until)
+        })
+        .collect()
+}
+
+/// The `YYYY-MM-DD` out of an instant, which is the grain a day bucket is keyed by.
+fn day_of(timestamp: &str) -> String {
+    timestamp.split('T').next().unwrap_or_default().to_string()
+}
+
 pub async fn timeline(ctx: &Context, after: Option<&str>, before: Option<&str>) -> Result<()> {
     let timeline = ctx
         .client
         .assets
         .timeline(&TimelineQuery::default())
         .await?;
-    let buckets: Vec<_> = timeline
-        .buckets
-        .into_iter()
-        .filter(|bucket| after.map(|a| bucket.date.as_str() >= a).unwrap_or(true))
-        .filter(|bucket| before.map(|b| bucket.date.as_str() <= b).unwrap_or(true))
-        .collect();
+    let buckets = within(timeline.buckets, after, before);
 
     if ctx.out.is_json() {
         return ctx.out.json(&json!({ "buckets": buckets }));
@@ -501,4 +529,85 @@ pub async fn restore(ctx: &Context, args: &RestoreArgs) -> Result<()> {
         GREEN,
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imogen_sdk::TimelineBucket;
+
+    fn days(dates: &[&str]) -> Vec<TimelineBucket> {
+        dates
+            .iter()
+            .map(|date| TimelineBucket {
+                date: (*date).into(),
+                count: 1,
+                cover_asset_id: None,
+            })
+            .collect()
+    }
+
+    fn kept(after: Option<&str>, before: Option<&str>) -> Vec<String> {
+        within(
+            days(&[
+                "2012-01-04",
+                "2011-12-31",
+                "2011-08-15",
+                "2011-01-01",
+                "2010-12-31",
+            ]),
+            after,
+            before,
+        )
+        .into_iter()
+        .map(|bucket| bucket.date)
+        .collect()
+    }
+
+    /// A bound less than a whole day means the whole of that period. Compared raw,
+    /// `"2011-08-15" <= "2011"` is false, so `--before 2011` answered with nothing at all
+    /// and looked like a library with no photographs in it.
+    #[test]
+    fn a_bare_year_covers_the_whole_year() {
+        assert_eq!(
+            kept(None, Some("2011")),
+            vec!["2011-12-31", "2011-08-15", "2011-01-01", "2010-12-31"]
+        );
+        assert_eq!(
+            kept(Some("2011"), None),
+            vec!["2012-01-04", "2011-12-31", "2011-08-15", "2011-01-01"]
+        );
+        assert_eq!(
+            kept(Some("2011"), Some("2011")),
+            vec!["2011-12-31", "2011-08-15", "2011-01-01"],
+            "both bounds together are the whole year and nothing else"
+        );
+    }
+
+    /// And the same for a bare month, whose last day is not the same in every month.
+    #[test]
+    fn a_bare_month_covers_the_whole_month() {
+        assert_eq!(
+            kept(None, Some("2011-08")),
+            vec!["2011-08-15", "2011-01-01", "2010-12-31"]
+        );
+        assert_eq!(kept(Some("2011-08"), Some("2011-08")), vec!["2011-08-15"]);
+        assert_eq!(
+            within(days(&["2011-02-28"]), None, Some("2011-02"))
+                .into_iter()
+                .map(|bucket| bucket.date)
+                .collect::<Vec<_>>(),
+            vec!["2011-02-28"],
+            "February ends on its own last day"
+        );
+    }
+
+    #[test]
+    fn a_whole_day_is_still_taken_at_its_word() {
+        assert_eq!(
+            kept(Some("2011-08-15"), Some("2011-08-15")),
+            vec!["2011-08-15"]
+        );
+        assert_eq!(kept(None, None).len(), 5, "no bounds keeps everything");
+    }
 }
