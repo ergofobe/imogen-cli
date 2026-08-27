@@ -217,6 +217,11 @@ the footer counts them off, and the grid reloads when the run ends so new photog
 appear where their dates put them rather than at the end. Upload while browsing an album
 and they are filed into it.
 
+A photograph is stored before it is processed, so for a second or two after it lands there
+is no thumbnail to show — the server is still making one. The browser keeps asking about
+anything it can see that is not finished yet, and fills the picture in when it appears.
+Nothing needs reloading.
+
 For anything with metadata to carry — a date, a place, a caption — use `imogen upload` from
 the shell instead: the browser sends the files and nothing else.
 

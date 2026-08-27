@@ -46,6 +46,8 @@ enum Loaded {
     /// every variant of this enum as large as the largest one.
     Uploaded(PathBuf, Box<Result<imogen_sdk::AssetUploadResult>>),
     Filed(Result<u64>),
+    /// One asset re-read, to see whether the server has finished with it yet.
+    Refreshed(String, Box<Result<imogen_sdk::Asset>>),
     /// A picture decoded from the local filesystem, for the picker's preview pane.
     /// `None` means it could not be decoded, which is recorded so it is not retried.
     LocalPreview(PathBuf, Option<Arc<DynamicImage>>),
@@ -54,6 +56,11 @@ enum Loaded {
 /// How many files to send at once from the browser. Lower than the command line's six:
 /// the same connection is also fetching the thumbnails being looked at.
 const UPLOAD_CONCURRENCY: usize = 4;
+
+/// How often to ask the server whether a photograph it was still working on is done. Slow
+/// enough to be nothing on a library, quick enough that an upload appears while you are
+/// still looking at the place it landed.
+const PROCESSING_POLL: Duration = Duration::from_millis(1200);
 
 pub async fn run(ctx: &Context) -> Result<()> {
     if !stdout().is_terminal() {
@@ -82,6 +89,8 @@ async fn event_loop(ctx: &Context) -> Result<()> {
 
     let mut app = App::new();
     let mut keys = key_stream();
+    let mut poll = tokio::time::interval(PROCESSING_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut work: FuturesUnordered<Job<'_>> = FuturesUnordered::new();
 
     work.push(Box::pin(load_page(ctx, app.to_query(), None)));
@@ -161,6 +170,15 @@ async fn event_loop(ctx: &Context) -> Result<()> {
                 None => return Ok(()),
             },
             Some(loaded) = work.next() => absorb(&mut app, loaded),
+            // Only while something is actually being processed: an idle library has no
+            // reason to be woken up.
+            _ = poll.tick(), if !app.pending_on_screen().is_empty() => {
+                for id in app.pending_on_screen() {
+                    if app.refreshing.insert(id.clone()) {
+                        work.push(Box::pin(load_asset(ctx, id)));
+                    }
+                }
+            }
         }
     }
 }
@@ -197,6 +215,11 @@ fn load_page(
 ) -> impl std::future::Future<Output = Loaded> + '_ {
     query.cursor = cursor;
     async move { Loaded::Page(ctx.client.assets.list(&query).await.map_err(Into::into)) }
+}
+
+async fn load_asset(ctx: &Context, id: String) -> Loaded {
+    let asset = ctx.client.assets.get(&id).await.map_err(Into::into);
+    Loaded::Refreshed(id, Box::new(asset))
 }
 
 async fn load_albums(ctx: &Context) -> Loaded {
@@ -346,6 +369,13 @@ fn absorb(app: &mut App, loaded: Loaded) {
                 }
             }
         }
+        Loaded::Refreshed(id, result) => match *result {
+            Ok(asset) => app.apply_refreshed(asset),
+            // Leave it marked as still being worked on; the next tick asks again.
+            Err(_) => {
+                app.refreshing.remove(&id);
+            }
+        },
         Loaded::LocalPreview(path, image) => {
             app.local_previews.insert(path, image);
             app.images_dirty = true;
