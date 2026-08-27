@@ -95,10 +95,17 @@ pub async fn browser_login(
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
     let oauth = OAuthClient::new(server.to_string());
+    // Discovery and registration are separate steps against separate URLs, and they fail
+    // for entirely different reasons — one means the server is unreachable, the other
+    // means it declined. Reporting both as "could not register" sends somebody looking in
+    // the wrong place. The result is cached, so naming the step costs no extra request.
+    oauth.discover().await.with_context(|| {
+        format!("Could not reach {server}. Check the URL, and that the server is up.")
+    })?;
     let client = oauth
         .register(app_name, std::slice::from_ref(&redirect_uri), scopes)
         .await
-        .with_context(|| format!("Could not register this machine with {server}"))?;
+        .with_context(|| format!("{server} would not register this machine"))?;
     let pending = oauth
         .begin_authorization(&client.client_id, &redirect_uri, scopes)
         .await?;
