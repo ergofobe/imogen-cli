@@ -1,7 +1,7 @@
 //! People, as grouped by face recognition.
 
 use anyhow::Result;
-use imogen_sdk::PersonUpdate;
+use imogen_sdk::{AssetFilter, PersonUpdate};
 use serde_json::json;
 
 use crate::cli::PeopleCommand;
@@ -49,30 +49,50 @@ async fn list(ctx: &Context, hidden: bool) -> Result<()> {
             ]
         })
         .collect();
-    ctx.out.table(&["ID", "NAME", "PHOTOS", ""], &rows);
+    // FACES, not PHOTOS: `photoCount` on the wire is the server's `faceCount`, and one
+    // photograph holding two faces of the same person counts twice in it.
+    ctx.out.table(&["ID", "NAME", "FACES", ""], &rows);
     Ok(())
 }
 
+/// The person, and every photograph they appear in.
+///
+/// Two things were wrong here at once. The photos on `GET /people/{id}` are a capped
+/// cover sample, so this pages the timeline under a `personId` filter instead — every
+/// one, because `imogen people show alice --ids` feeds a pipeline. And `photoCount` on
+/// the wire is the server's `faceCount`: it counts faces, so a photograph with two of
+/// this person's faces in it counts twice. It is still worth showing, but only under its
+/// own name. "photographs" is the number of rows below it; "faces" is the other number.
 async fn show(ctx: &Context, reference: &str, ids_only: bool) -> Result<()> {
     let person = ctx.find_person(reference).await?;
-    let full = ctx.client.people.get(&person.id).await?;
+    let tiles = crate::commands::assets::all_tiles(
+        ctx,
+        &AssetFilter {
+            person_id: Some(person.id.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+
     if ctx.out.is_json() {
-        return ctx.out.json(&full);
+        return ctx.out.json(&json!({
+            "person": person,
+            "items": tiles,
+            "count": tiles.len(),
+            "faceCount": person.photo_count,
+        }));
     }
     if ids_only {
-        for photo in &full.photos {
-            ctx.out.value(&photo.id);
-        }
-        return Ok(());
+        return crate::commands::assets::print_tiles(ctx, &tiles, true);
     }
-    ctx.out
-        .heading(full.person.name.as_deref().unwrap_or("unnamed"));
+    ctx.out.heading(person.name.as_deref().unwrap_or("unnamed"));
     ctx.out.fields(&[
-        ("id", full.person.id.clone()),
-        ("photographs", full.person.photo_count.to_string()),
+        ("id", person.id.clone()),
+        ("photographs", tiles.len().to_string()),
+        ("faces", person.photo_count.to_string()),
     ]);
     ctx.out.line("");
-    crate::commands::assets::print_assets(ctx, &full.photos, false)
+    crate::commands::assets::print_tiles(ctx, &tiles, false)
 }
 
 async fn rename(ctx: &Context, reference: &str, name: &str) -> Result<()> {

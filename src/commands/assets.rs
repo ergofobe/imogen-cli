@@ -2,7 +2,8 @@
 
 use anyhow::{bail, Result};
 use imogen_sdk::{
-    Asset, AssetSelection, AssetStatus, AssetType, AssetUpdate, GeoPoint, TimelineQuery,
+    Asset, AssetFilter, AssetSelection, AssetStatus, AssetType, AssetUpdate, GeoPoint, TilePage,
+    TimelineBucket, TimelineBucketQuery, TimelineQuery, TimelineTile,
 };
 use serde_json::json;
 
@@ -84,6 +85,138 @@ fn flags(ctx: &Context, asset: &Asset) -> String {
             AssetStatus::Processing => "processing",
             _ => "",
         })),
+    }
+    marks.join(" ")
+}
+
+/// Every photograph under a filter, to the last one.
+///
+/// `GET /albums/{id}` and `GET /people/{id}` hand back a capped cover sample now, so
+/// anything that has to enumerate a whole album or a whole person walks the timeline
+/// instead — the same surface the web grid pages, under an `albumId` or `personId`
+/// filter. The day buckets say which periods exist; each period is then followed by its
+/// cursor to the end. Nothing here caps or limits: a short list feeding `xargs` is a
+/// silently wrong list.
+pub async fn all_tiles(ctx: &Context, filter: &AssetFilter) -> Result<Vec<TimelineTile>> {
+    let timeline = ctx
+        .client
+        .assets
+        .timeline(&TimelineQuery {
+            covers: None,
+            filter: filter.clone(),
+        })
+        .await?;
+    collect_tiles(&timeline.buckets, |period, cursor| async move {
+        let page = ctx
+            .client
+            .assets
+            .timeline_bucket(&TimelineBucketQuery {
+                period,
+                cursor,
+                // Unset, so the server's own page size applies rather than a guess here.
+                limit: None,
+                filter: filter.clone(),
+            })
+            .await?;
+        Ok(page)
+    })
+    .await
+}
+
+/// The walk itself, over whatever fetches a page — the network in earnest, a fake under
+/// test.
+async fn collect_tiles<F, Fut>(
+    buckets: &[TimelineBucket],
+    mut fetch: F,
+) -> Result<Vec<TimelineTile>>
+where
+    F: FnMut(String, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<TilePage>>,
+{
+    let mut tiles = Vec::new();
+    for period in periods_of(buckets) {
+        let mut cursor = None;
+        loop {
+            let page = fetch(period.clone(), cursor).await?;
+            tiles.extend(page.items);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+    }
+    Ok(tiles)
+}
+
+/// The months the day buckets fall in, each once, in the order the timeline gave them.
+///
+/// Months rather than days because the bucket endpoint takes either, and a month is one
+/// round trip where its days would be thirty.
+fn periods_of(buckets: &[TimelineBucket]) -> Vec<String> {
+    let mut periods: Vec<String> = Vec::new();
+    for bucket in buckets {
+        let period: String = bucket.date.chars().take(7).collect();
+        if !periods.contains(&period) {
+            periods.push(period);
+        }
+    }
+    periods
+}
+
+/// The rows a timeline tile can fill.
+///
+/// A tile is the grid's lean projection, and it carries no filename, no size, and no
+/// archived or trashed mark. Those columns are left out rather than printed empty:
+/// hydrating a whole album into `Asset`s to fill them would be one request per
+/// photograph. `imogen ls --album <name> --all` still walks `GET /assets` and prints the
+/// full row for anyone who wants it.
+pub fn print_tiles(ctx: &Context, tiles: &[TimelineTile], ids_only: bool) -> Result<()> {
+    if ids_only {
+        for tile in tiles {
+            ctx.out.value(&tile.id);
+        }
+        return Ok(());
+    }
+    if tiles.is_empty() {
+        ctx.out.note("Nothing matched.");
+        return Ok(());
+    }
+
+    let rows: Vec<Vec<String>> = tiles
+        .iter()
+        .map(|tile| {
+            vec![
+                tile.id.clone(),
+                output::date(&tile.captured_at),
+                match tile.r#type {
+                    AssetType::Image => "photo".into(),
+                    AssetType::Video => match tile.duration {
+                        Some(seconds) => format!("video, {seconds:.0}s"),
+                        None => "video".into(),
+                    },
+                },
+                tile_flags(ctx, tile),
+            ]
+        })
+        .collect();
+
+    ctx.out.table(&["ID", "TAKEN", "KIND", ""], &rows);
+    ctx.out.note(format!("\n{} shown", tiles.len()));
+    Ok(())
+}
+
+/// The marks a tile can carry. Archived and trashed are absent by construction: the
+/// timeline excludes both unless asked for them, and a tile could not say so anyway.
+fn tile_flags(ctx: &Context, tile: &TimelineTile) -> String {
+    let mut marks = Vec::new();
+    if tile.favorite {
+        marks.push(ctx.out.paint("★", YELLOW));
+    }
+    match tile.status {
+        AssetStatus::Ready => {}
+        AssetStatus::Failed => marks.push(ctx.out.paint("failed", RED)),
+        AssetStatus::Pending => marks.push(ctx.out.dim("pending")),
+        AssetStatus::Processing => marks.push(ctx.out.dim("processing")),
     }
     marks.join(" ")
 }
@@ -535,6 +668,7 @@ pub async fn restore(ctx: &Context, args: &RestoreArgs) -> Result<()> {
 mod tests {
     use super::*;
     use imogen_sdk::TimelineBucket;
+    use std::collections::HashMap;
 
     fn days(dates: &[&str]) -> Vec<TimelineBucket> {
         dates
@@ -609,5 +743,87 @@ mod tests {
             vec!["2011-08-15"]
         );
         assert_eq!(kept(None, None).len(), 5, "no bounds keeps everything");
+    }
+
+    fn tile(id: &str) -> TimelineTile {
+        TimelineTile {
+            id: id.into(),
+            captured_at: "2011-08-15T00:00:00.000Z".into(),
+            width: None,
+            height: None,
+            r#type: AssetType::Image,
+            status: AssetStatus::Ready,
+            favorite: false,
+            duration: None,
+            placeholder_color: None,
+            live_photo_video_id: None,
+        }
+    }
+
+    /// A stand-in for `GET /assets/timeline/bucket`: months, each holding one or more
+    /// pages, with the page index standing in for the opaque cursor.
+    fn pages_of(month: &str) -> Vec<Vec<&'static str>> {
+        let library: HashMap<&str, Vec<Vec<&'static str>>> = HashMap::from([
+            ("2011-08", vec![vec!["a", "b"]]),
+            // Three pages: a month heavy enough that one round trip is not the whole of it.
+            ("2011-07", vec![vec!["c", "d"], vec!["e", "f"], vec!["g"]]),
+            ("2010-12", vec![vec!["h"]]),
+        ]);
+        library
+            .get(month)
+            .unwrap_or_else(|| panic!("asked for {month}, which the timeline never listed"))
+            .clone()
+    }
+
+    /// The whole point of the walk: an album or a person is enumerated to the last
+    /// photograph, because the ids feed `xargs` and a short list is a silently wrong one.
+    ///
+    /// Two ways to get this wrong are both pinned here — stopping at the first page of a
+    /// month, and stopping at the first month — because either leaves a list that looks
+    /// perfectly well-formed.
+    #[tokio::test]
+    async fn every_page_of_every_month_is_walked() {
+        let buckets = days(&[
+            "2011-08-15",
+            "2011-08-02",
+            "2011-07-30",
+            "2011-07-01",
+            "2010-12-31",
+        ]);
+
+        let tiles = collect_tiles(&buckets, |period, cursor| async move {
+            let pages = pages_of(&period);
+            let index: usize = cursor.map(|c| c.parse().unwrap()).unwrap_or(0);
+            Ok(TilePage {
+                items: pages[index].iter().map(|id| tile(id)).collect(),
+                next_cursor: (index + 1 < pages.len()).then(|| (index + 1).to_string()),
+                total: None,
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tiles.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d", "e", "f", "g", "h"],
+            "every tile in every month, in timeline order"
+        );
+    }
+
+    /// Days are what the timeline hands back and months are what the bucket endpoint
+    /// takes, so the walk asks for each month once rather than for each day.
+    #[test]
+    fn the_months_are_asked_for_once_each_newest_first() {
+        assert_eq!(
+            periods_of(&days(&[
+                "2011-08-15",
+                "2011-08-02",
+                "2011-07-30",
+                "2011-07-01",
+                "2010-12-31",
+            ])),
+            vec!["2011-08", "2011-07", "2010-12"]
+        );
+        assert!(periods_of(&[]).is_empty());
     }
 }
