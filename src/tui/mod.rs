@@ -43,10 +43,11 @@ enum Loaded {
     /// The shape of the whole library: one entry a day. Small enough to hold for twenty
     /// years, which is the whole point of it. Carries the epoch it was asked under.
     Spine(u64, Result<Vec<imogen_sdk::TimelineBucket>>),
-    /// One `YYYY-MM` of tiles, named so a slow answer is filed under the period it was
-    /// asked for rather than under wherever the viewport has since moved, and stamped so
-    /// an answer for results that no longer exist is dropped rather than believed.
-    Bucket(u64, String, Result<imogen_sdk::TilePage>),
+    /// One `YYYY-MM` of tiles: the epoch it was asked under, the period it belongs to, the
+    /// cursor it was asked from (`None` for a first page), and the answer. The period and
+    /// the cursor together are the question it answers, so an answer to a question nobody
+    /// is asking any more can be told apart from one that is still wanted.
+    Bucket(u64, String, Option<String>, Result<imogen_sdk::TilePage>),
     Albums(Result<Vec<imogen_sdk::Album>>),
     /// Boxed: an upload result carries a whole `Asset`, which would otherwise make
     /// every variant of this enum as large as the largest one.
@@ -258,13 +259,14 @@ async fn load_spine(ctx: &Context, query: TimelineQuery, epoch: u64) -> Loaded {
 
 async fn load_bucket(ctx: &Context, query: TimelineBucketQuery, epoch: u64) -> Loaded {
     let period = query.period.clone();
+    let asked_from = query.cursor.clone();
     let page = ctx
         .client
         .assets
         .timeline_bucket(&query)
         .await
         .map_err(Into::into);
-    Loaded::Bucket(epoch, period, page)
+    Loaded::Bucket(epoch, period, asked_from, page)
 }
 
 async fn load_asset(ctx: &Context, id: String) -> Loaded {
@@ -455,9 +457,20 @@ fn absorb(app: &mut App, loaded: Loaded) {
         // anything is touched — clearing the in-flight mark here would cancel the request
         // the *current* results have out for the same period, and then the correct tiles
         // would never arrive either, because a period held whole is never asked for again.
-        Loaded::Bucket(epoch, _, _) if epoch != app.epoch => {}
-        Loaded::Bucket(_, period, Ok(page)) => {
+        Loaded::Bucket(epoch, _, _, _) if epoch != app.epoch => {}
+        Loaded::Bucket(_, period, asked_from, Ok(page)) => {
+            // The request is over either way, and the mark can only be this request's own:
+            // at most one is ever out for a period, which is why the forget leaves it be.
             app.period_inflight.remove(&period);
+
+            if !app.accepts_page(&period, asked_from.as_deref()) {
+                // A continuation of a period the viewport has since scrolled away from.
+                // Dropped, which leaves that period with no tiles and no cursor — exactly
+                // what "not held at all" looks like — so the next pass asks again from the
+                // first page rather than treating page two as page one.
+                return;
+            }
+
             match page.next_cursor {
                 Some(cursor) => {
                     app.period_more.insert(period.clone(), cursor);
@@ -466,11 +479,19 @@ fn absorb(app: &mut App, loaded: Loaded) {
                     app.period_more.remove(&period);
                 }
             }
-            app.periods.entry(period).or_default().extend(page.items);
+            match asked_from {
+                // A first page starts the prefix rather than adding to one.
+                None => {
+                    app.periods.insert(period, page.items);
+                }
+                Some(_) => {
+                    app.periods.entry(period).or_default().extend(page.items);
+                }
+            }
             app.rebuild_window();
             app.images_dirty = true;
         }
-        Loaded::Bucket(_, period, Err(error)) => {
+        Loaded::Bucket(_, period, _, Err(error)) => {
             app.period_inflight.remove(&period);
             app.note(format!("Could not load photographs: {error}"));
         }
@@ -1500,6 +1521,7 @@ mod tests {
                 Loaded::Bucket(
                     epoch,
                     period.clone(),
+                    None,
                     Ok(imogen_sdk::TilePage {
                         items: (start..start + count)
                             .map(|n| tile(&format!("a{n}"), "2011-01-01T00:00:00.000Z"))
@@ -1652,6 +1674,198 @@ mod tests {
         assert_eq!(detail_wanted(&mut app).as_deref(), Some("a"));
     }
 
+    /// One page of a period, as the server would answer it.
+    fn part(ids: &[&str], next: Option<&str>) -> imogen_sdk::TilePage {
+        imogen_sdk::TilePage {
+            items: ids
+                .iter()
+                .map(|id| tile(id, "2011-08-14T00:00:00.000Z"))
+                .collect(),
+            next_cursor: next.map(str::to_string),
+            total: None,
+        }
+    }
+
+    /// A month too big for one answer — a scanned-archive import can land forty thousand
+    /// photographs on one date — with its first page in and its second page out.
+    fn mid_pagination() -> App {
+        let mut app = App::new();
+        app.buckets = vec![bucket("2011-08-14", 4)];
+        app.recount();
+        let epoch = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Bucket(
+                epoch,
+                "2011-08".into(),
+                None,
+                Ok(part(&["a0", "a1"], Some("cursor-1"))),
+            ),
+        );
+        assert_eq!(
+            app.period_wanted("2011-08"),
+            Some(Some("cursor-1".into())),
+            "the month is not held whole yet"
+        );
+        app.period_inflight.insert("2011-08".into());
+        app
+    }
+
+    /// The residual the epoch could never see, because it needs no scope change. Scroll
+    /// away from a month mid-pagination and its second page arrives into a period that
+    /// has been forgotten — where, filed, it becomes that period's *first* page: the third
+    /// photograph of August drawn at August's first index, the month counting as held
+    /// whole, and so never asked for again.
+    #[test]
+    fn a_page_arriving_into_a_forgotten_period_is_dropped_not_taken_for_its_first() {
+        let mut app = mid_pagination();
+        let epoch = app.epoch;
+
+        // The viewport scrolls off August entirely.
+        app.forget_periods_outside(&[]);
+
+        // And page two turns up.
+        absorb(
+            &mut app,
+            Loaded::Bucket(
+                epoch,
+                "2011-08".into(),
+                Some("cursor-1".into()),
+                Ok(part(&["a2", "a3"], None)),
+            ),
+        );
+
+        assert!(
+            app.periods.is_empty(),
+            "page two is not page one, and must not become it"
+        );
+        app.rebuild_window();
+        assert_ne!(
+            app.window.get(0).map(|tile| tile.id.as_str()),
+            Some("a2"),
+            "the third photograph must not be drawn at the month's first index"
+        );
+        assert!(app.window.get(0).is_none());
+        assert_eq!(
+            app.period_wanted("2011-08"),
+            Some(None),
+            "and the month is asked for again from its first page, not stranded"
+        );
+    }
+
+    /// The tempting wrong version of the fix is to clear `period_inflight` in the forget.
+    /// It un-strands the period, but it also breaks the one-request-at-a-time invariant
+    /// that lets an answer clear the mark without wondering whose request it is — so the
+    /// month gets asked for twice while the first answer is still coming.
+    #[test]
+    fn forgetting_a_period_does_not_ask_again_while_its_answer_is_still_coming() {
+        let mut app = mid_pagination();
+        app.forget_periods_outside(&[]);
+
+        assert_eq!(
+            app.period_wanted("2011-08"),
+            None,
+            "one request at a time per period: the answer is still on its way"
+        );
+
+        // Only once that answer has landed — and been dropped — is it asked for again.
+        let epoch = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Bucket(
+                epoch,
+                "2011-08".into(),
+                Some("cursor-1".into()),
+                Ok(part(&["a2", "a3"], None)),
+            ),
+        );
+        assert_eq!(app.period_wanted("2011-08"), Some(None));
+    }
+
+    /// And the guard must not simply refuse every continuation: a page that answers what
+    /// the period is actually asking still extends it, and completes it.
+    #[test]
+    fn a_page_that_answers_what_the_period_is_asking_is_still_filed() {
+        let mut app = mid_pagination();
+        let epoch = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Bucket(
+                epoch,
+                "2011-08".into(),
+                Some("cursor-1".into()),
+                Ok(part(&["a2", "a3"], None)),
+            ),
+        );
+
+        assert_eq!(app.periods["2011-08"].len(), 4, "both pages, in order");
+        assert_eq!(app.window.get(0).map(|tile| tile.id.as_str()), Some("a0"));
+        assert_eq!(app.window.get(3).map(|tile| tile.id.as_str()), Some("a3"));
+        assert_eq!(
+            app.period_wanted("2011-08"),
+            None,
+            "and now the month really is held whole"
+        );
+    }
+
+    /// Belt and braces, and deliberately so. Nothing today can deliver a first page into a
+    /// period that already holds tiles — `period_wanted` only asks for one when the period
+    /// is held not at all — so this cannot happen as the code stands. It is pinned because
+    /// the reason it cannot happen lives in a different function from the one that would
+    /// suffer for it: a first page *starts* a period's tiles rather than adding to them,
+    /// and that should stay true by construction rather than by an argument about which
+    /// requests can be in flight.
+    #[test]
+    fn a_first_page_starts_a_period_rather_than_adding_to_it() {
+        let mut app = mid_pagination();
+        let epoch = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Bucket(
+                epoch,
+                "2011-08".into(),
+                None,
+                Ok(part(&["a0", "a1"], Some("cursor-1"))),
+            ),
+        );
+        assert_eq!(
+            app.periods["2011-08"].len(),
+            2,
+            "two photographs, not the same two twice"
+        );
+    }
+
+    /// A continuation quoting a cursor the period has moved past is answering a question
+    /// asked two fetches ago. The cursor is the identity of the page wanted, not merely a
+    /// flag that some page is wanted.
+    #[test]
+    fn a_continuation_from_the_wrong_cursor_is_not_filed() {
+        let mut app = mid_pagination();
+        let epoch = app.epoch;
+        absorb(
+            &mut app,
+            Loaded::Bucket(
+                epoch,
+                "2011-08".into(),
+                Some("some-older-cursor".into()),
+                Ok(part(&["wrong-a", "wrong-b"], None)),
+            ),
+        );
+        assert_eq!(
+            app.periods["2011-08"],
+            vec![
+                tile("a0", "2011-08-14T00:00:00.000Z"),
+                tile("a1", "2011-08-14T00:00:00.000Z")
+            ],
+            "page one is untouched"
+        );
+        assert_eq!(
+            app.period_wanted("2011-08"),
+            Some(Some("cursor-1".into())),
+            "and the page actually wanted is still wanted"
+        );
+    }
+
     /// A page of tiles as the server would answer for one period.
     fn page(ids: &[&str]) -> imogen_sdk::TilePage {
         imogen_sdk::TilePage {
@@ -1695,6 +1909,7 @@ mod tests {
             Loaded::Bucket(
                 stale,
                 "2011-08".into(),
+                None,
                 Ok(page(&["library-a", "library-b"])),
             ),
         );
@@ -1717,7 +1932,12 @@ mod tests {
         let now = app.epoch;
         absorb(
             &mut app,
-            Loaded::Bucket(now, "2011-08".into(), Ok(page(&["trash-a", "trash-b"]))),
+            Loaded::Bucket(
+                now,
+                "2011-08".into(),
+                None,
+                Ok(page(&["trash-a", "trash-b"])),
+            ),
         );
         assert_eq!(
             app.window.get(0).map(|tile| tile.id.as_str()),

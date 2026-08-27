@@ -438,9 +438,35 @@ impl App {
 
     /// Drops the periods the viewport has moved away from. This is the other half of the
     /// bound on memory: the thumbnail cache caps the pictures, this caps the tiles.
+    ///
+    /// `period_inflight` is deliberately left alone. It is what makes "at most one request
+    /// is ever out for a period" true, and that in turn is what lets an answer clear the
+    /// mark without having to wonder whose request it belongs to. Forgetting a period does
+    /// not un-send the request already out for it; it only stops wanting the answer, which
+    /// is [`App::accepts_page`]'s job rather than this one's.
     pub fn forget_periods_outside(&mut self, keep: &[String]) {
         self.periods.retain(|period, _| keep.contains(period));
         self.period_more.retain(|period, _| keep.contains(period));
+    }
+
+    /// Whether a page answers the question this period is currently asking.
+    ///
+    /// A period's tiles are only meaningful as a complete prefix from its first page, so
+    /// the two kinds of page are not interchangeable. A first page always answers
+    /// something — it *starts* the prefix. A continuation answers "what follows this
+    /// cursor", which is only a question while the period is still asking it, and
+    /// `period_more` is where that question is written down.
+    ///
+    /// Without this, a month big enough to paginate that the viewport scrolled away from
+    /// mid-fetch would take its second page as its first: the third photograph of August
+    /// drawn at August's first index, the month then counting as held whole, and so never
+    /// asked for again. Wrong photographs at plausible places, silently and permanently —
+    /// the same shape as a stale scope's answer, reached without any scope change.
+    pub fn accepts_page(&self, period: &str, asked_from: Option<&str>) -> bool {
+        match asked_from {
+            None => true,
+            Some(cursor) => self.period_more.get(period).map(String::as_str) == Some(cursor),
+        }
     }
 
     /// Lays the held periods end to end into the run of tiles the grid indexes into.
