@@ -15,8 +15,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::output;
 use crate::tui::app::{App, Mode, Tile};
 
-const ACCENT: Color = Color::Rgb(0xE0, 0xA1, 0x62);
+const ACCENT: Color = Color::Rgb(0xE3, 0x9B, 0x5C);
 const MUTED: Color = Color::Rgb(0x90, 0x96, 0xA0);
+const BORDER: Color = Color::Rgb(0x26, 0x2A, 0x2F);
 
 /// Works out where everything goes, including the holes the photographs are placed into.
 /// Called before drawing so the placement pass and the draw pass agree.
@@ -280,7 +281,7 @@ fn draw_grid(frame: &mut Frame, app: &App) {
         let border = if selected {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32))
+            Style::default().fg(BORDER)
         };
         frame.render_widget(
             Block::default().borders(Borders::ALL).border_style(border),
@@ -335,7 +336,7 @@ fn draw_viewer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32)))
+            .border_style(Style::default().fg(BORDER))
             .title(Span::styled(title, Style::default().fg(ACCENT))),
         area,
     );
@@ -402,7 +403,7 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32)))
+                    .border_style(Style::default().fg(BORDER))
                     .title(Span::styled(
                         format!(" {} ", output::truncate_left(&here, 46)),
                         Style::default().fg(ACCENT),
@@ -423,7 +424,7 @@ fn draw_picker(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32))),
+            .border_style(Style::default().fg(BORDER)),
         pane,
     );
 
@@ -506,7 +507,7 @@ fn draw_albums(frame: &mut Frame, app: &App, area: Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32)))
+                    .border_style(Style::default().fg(BORDER))
                     .title(Span::styled(" albums ", Style::default().fg(ACCENT))),
             )
             .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -564,7 +565,7 @@ fn draw_info(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             Block::default()
                 .borders(Borders::LEFT)
-                .border_style(Style::default().fg(Color::Rgb(0x2A, 0x2D, 0x32)))
+                .border_style(Style::default().fg(BORDER))
                 .padding(ratatui::widgets::Padding::horizontal(1)),
         ),
         area,
