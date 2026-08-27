@@ -1,7 +1,7 @@
 //! Albums, and the links that publish them.
 
 use anyhow::Result;
-use imogen_sdk::{AlbumCreate, AlbumUpdate};
+use imogen_sdk::{AlbumCreate, AlbumUpdate, AssetFilter, AssetSelection};
 use serde_json::json;
 
 use crate::cli::{AlbumCommand, QueryArgs};
@@ -74,30 +74,47 @@ async fn list(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// The album, and every photograph in it.
+///
+/// The assets on `GET /albums/{id}` are a capped cover sample now — sixty of them,
+/// however many the album holds — so this pages the timeline under an `albumId` filter
+/// instead. It has to be every one: `imogen album show holidays --ids | xargs imogen
+/// trash` is a real pipeline, and a list quietly cut to sixty would trash sixty.
+///
+/// The header counts what was actually fetched rather than the album's own
+/// `assetCount`, so the number above the rows is the number of rows. The two agree in
+/// the ordinary case — both leave out the trashed, the archived and the vaulted — and
+/// where they would not, the honest number is the one belonging to the list printed.
 async fn show(ctx: &Context, reference: &str, ids_only: bool) -> Result<()> {
     let album = ctx.find_album(reference).await?;
-    let full = ctx.client.albums.get(&album.id).await?;
+    let tiles = crate::commands::assets::all_tiles(
+        ctx,
+        &AssetFilter {
+            album_id: Some(album.id.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+
     if ctx.out.is_json() {
-        return ctx.out.json(&full);
+        return ctx.out.json(&json!({
+            "album": album,
+            "items": tiles,
+            "count": tiles.len(),
+        }));
     }
     if ids_only {
-        for asset in &full.assets {
-            ctx.out.value(&asset.id);
-        }
-        return Ok(());
+        return crate::commands::assets::print_tiles(ctx, &tiles, true);
     }
-    ctx.out.heading(&full.album.name);
+    ctx.out.heading(&album.name);
     ctx.out.fields(&[
-        ("id", full.album.id.clone()),
-        (
-            "description",
-            full.album.description.clone().unwrap_or_default(),
-        ),
-        ("photographs", full.album.asset_count.to_string()),
-        ("created", crate::output::date(&full.album.created_at)),
+        ("id", album.id.clone()),
+        ("description", album.description.clone().unwrap_or_default()),
+        ("photographs", tiles.len().to_string()),
+        ("created", crate::output::date(&album.created_at)),
         (
             "public link",
-            full.album
+            album
                 .share_slug
                 .as_ref()
                 .map(|slug| format!("{}/share/{slug}", ctx.server))
@@ -105,7 +122,7 @@ async fn show(ctx: &Context, reference: &str, ids_only: bool) -> Result<()> {
         ),
     ]);
     ctx.out.line("");
-    crate::commands::assets::print_assets(ctx, &full.assets, false)
+    crate::commands::assets::print_tiles(ctx, &tiles, false)
 }
 
 async fn create(
@@ -193,7 +210,11 @@ async fn add(ctx: &Context, reference: &str, assets: &[String], query: &QueryArg
     let mut skipped = 0u64;
     let mut count = 0u64;
     for chunk in ids.chunks(500) {
-        let result = ctx.client.albums.add_assets(&album.id, chunk).await?;
+        let result = ctx
+            .client
+            .albums
+            .add_assets(&album.id, &AssetSelection::ids(chunk))
+            .await?;
         added += result.added;
         skipped += result.skipped;
         count = result.asset_count;
@@ -222,7 +243,11 @@ async fn add(ctx: &Context, reference: &str, assets: &[String], query: &QueryArg
 
 async fn remove(ctx: &Context, reference: &str, assets: &[String]) -> Result<()> {
     let album = ctx.find_album(reference).await?;
-    let result = ctx.client.albums.remove_assets(&album.id, assets).await?;
+    let result = ctx
+        .client
+        .albums
+        .remove_assets(&album.id, &AssetSelection::ids(assets))
+        .await?;
     if ctx.out.is_json() {
         return ctx.out.json(&result);
     }
