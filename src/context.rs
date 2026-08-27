@@ -123,6 +123,7 @@ impl Context {
                 MediaType::Video => AssetType::Video,
             }),
             album_id,
+            person_id: None,
             favorite: args.favorite.then_some(true),
             archived: args.archived.then_some(true),
             trashed: args.trashed.then_some(true),
