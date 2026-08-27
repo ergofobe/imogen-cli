@@ -1,6 +1,7 @@
 //! What the terminal browser is looking at.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use image::DynamicImage;
@@ -39,6 +40,8 @@ pub enum Mode {
     Search(String),
     Albums,
     Help,
+    /// Typing a path to upload. Applied on Enter, abandoned on Escape.
+    Upload(String),
     /// Waiting for a yes or a no before doing something that cannot be undone.
     Confirm {
         prompt: String,
@@ -86,6 +89,17 @@ pub struct App {
     pub tile_width: u16,
     pub tile_height: u16,
 
+    /// Files still to send, and how the run is going. The queue is drained a few at a
+    /// time by the event loop rather than all at once, so choosing a folder of three
+    /// thousand photographs does not open three thousand connections.
+    pub upload_queue: VecDeque<PathBuf>,
+    pub upload_inflight: usize,
+    pub upload_done: usize,
+    pub upload_failed: usize,
+    pub upload_total: usize,
+    /// What has landed, so it can be filed into the album being browsed once the run ends.
+    pub uploaded_ids: Vec<String>,
+
     pub status: Option<String>,
     pub loading: bool,
     pub images_dirty: bool,
@@ -115,6 +129,12 @@ impl App {
             columns: 1,
             tile_width: 20,
             tile_height: 9,
+            upload_queue: VecDeque::new(),
+            upload_inflight: 0,
+            upload_done: 0,
+            upload_failed: 0,
+            upload_total: 0,
+            uploaded_ids: Vec::new(),
             status: None,
             loading: false,
             images_dirty: true,
@@ -206,5 +226,14 @@ impl App {
 
     pub fn note(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
+    }
+
+    pub fn uploading(&self) -> bool {
+        self.upload_total > 0
+    }
+
+    /// True once every file has settled, one way or the other.
+    pub fn upload_finished(&self) -> bool {
+        self.uploading() && self.upload_queue.is_empty() && self.upload_inflight == 0
     }
 }

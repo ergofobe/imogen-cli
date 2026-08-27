@@ -10,6 +10,7 @@ mod app;
 mod ui;
 
 use std::io::{stdout, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use futures::stream::{FuturesUnordered, StreamExt};
 use image::DynamicImage;
-use imogen_sdk::{AssetUpdate, AssetVariant};
+use imogen_sdk::{AssetUpdate, AssetVariant, UploadOptions};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -39,7 +40,15 @@ enum Loaded {
     Preview(String, Result<Vec<u8>>),
     Page(Result<imogen_sdk::AssetPage>),
     Albums(Result<Vec<imogen_sdk::Album>>),
+    /// Boxed: an upload result carries a whole `Asset`, which would otherwise make
+    /// every variant of this enum as large as the largest one.
+    Uploaded(PathBuf, Box<Result<imogen_sdk::AssetUploadResult>>),
+    Filed(Result<u64>),
 }
+
+/// How many files to send at once from the browser. Lower than the command line's six:
+/// the same connection is also fetching the thumbnails being looked at.
+const UPLOAD_CONCURRENCY: usize = 4;
 
 pub async fn run(ctx: &Context) -> Result<()> {
     if !stdout().is_terminal() {
@@ -109,6 +118,16 @@ async fn event_loop(ctx: &Context) -> Result<()> {
             app.loading = true;
             work.push(Box::pin(load_page(ctx, app.to_query(), app.cursor.clone())));
         }
+        while app.upload_inflight < UPLOAD_CONCURRENCY {
+            let Some(path) = app.upload_queue.pop_front() else {
+                break;
+            };
+            app.upload_inflight += 1;
+            work.push(Box::pin(upload_one(ctx, path)));
+        }
+        if app.upload_finished() {
+            finish_upload(ctx, &mut app, &mut work);
+        }
 
         terminal.draw(|frame| ui::draw(frame, &app))?;
         if app.images_dirty {
@@ -174,6 +193,56 @@ async fn load_albums(ctx: &Context) -> Loaded {
     Loaded::Albums(ctx.client.albums.list().await.map_err(Into::into))
 }
 
+async fn upload_one(ctx: &Context, path: PathBuf) -> Loaded {
+    let result = ctx
+        .client
+        .assets
+        .upload(&path, &UploadOptions::default())
+        .await
+        .map_err(anyhow::Error::from);
+    Loaded::Uploaded(path, Box::new(result))
+}
+
+async fn fill_album(ctx: &Context, album_id: String, ids: Vec<String>) -> Loaded {
+    let mut added = 0u64;
+    for chunk in ids.chunks(500) {
+        match ctx.client.albums.add_assets(&album_id, chunk).await {
+            Ok(result) => added += result.added,
+            Err(error) => return Loaded::Filed(Err(error.into())),
+        }
+    }
+    Loaded::Filed(Ok(added))
+}
+
+/// Reports the run, files what landed into the album being browsed, and reloads so the new
+/// photographs appear where they belong rather than at the end.
+fn finish_upload<'a>(ctx: &'a Context, app: &mut App, work: &mut FuturesUnordered<Job<'a>>) {
+    let done = app.upload_done;
+    let failed = app.upload_failed;
+    let ids = std::mem::take(&mut app.uploaded_ids);
+    let album = app.album.as_ref().map(|album| album.id.clone());
+
+    app.upload_total = 0;
+    app.upload_done = 0;
+    app.upload_failed = 0;
+    app.note(format!(
+        "Uploaded {}{}.",
+        crate::output::plural(done, "file"),
+        if failed > 0 {
+            format!(", {failed} failed")
+        } else {
+            String::new()
+        }
+    ));
+
+    if let Some(album) = album {
+        if !ids.is_empty() {
+            work.push(Box::pin(fill_album(ctx, album, ids)));
+        }
+    }
+    reload(ctx, app, work);
+}
+
 async fn load_bytes(ctx: &Context, id: String, variant: AssetVariant, preview: bool) -> Loaded {
     let bytes = ctx
         .client
@@ -221,6 +290,25 @@ fn absorb(app: &mut App, loaded: Loaded) {
         }
         Loaded::Albums(Ok(albums)) => app.albums = albums,
         Loaded::Albums(Err(_)) => {}
+        Loaded::Uploaded(path, result) => {
+            app.upload_inflight = app.upload_inflight.saturating_sub(1);
+            match *result {
+                Ok(outcome) => {
+                    app.upload_done += 1;
+                    app.uploaded_ids.push(outcome.asset.id);
+                }
+                Err(error) => {
+                    app.upload_failed += 1;
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    app.note(format!("{name}: {error}"));
+                }
+            }
+        }
+        Loaded::Filed(Ok(_)) => {}
+        Loaded::Filed(Err(error)) => app.note(format!("Could not fill the album: {error}")),
     }
 }
 
@@ -303,6 +391,27 @@ async fn handle_key<'a>(
             KeyCode::Char(c) => {
                 input.push(c);
                 app.mode = Mode::Search(input);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Mode::Upload(current) = &app.mode {
+        let mut input = current.clone();
+        match key.code {
+            KeyCode::Esc => app.mode = Mode::Grid,
+            KeyCode::Enter => {
+                app.mode = Mode::Grid;
+                start_upload(app, &input);
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                app.mode = Mode::Upload(input);
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                app.mode = Mode::Upload(input);
             }
             _ => {}
         }
@@ -427,6 +536,13 @@ async fn handle_key<'a>(
             app.mode = Mode::Albums;
             app.images_dirty = true;
         }
+        KeyCode::Char('u') => {
+            if app.uploading() {
+                app.note("Still uploading. Wait for this run to finish.");
+            } else {
+                app.mode = Mode::Upload(String::new());
+            }
+        }
         KeyCode::Char('R') => reload(ctx, app, work),
         KeyCode::Char('1') => switch(ctx, app, work, Scope::Library),
         KeyCode::Char('2') => switch(ctx, app, work, Scope::Favorites),
@@ -458,6 +574,58 @@ async fn handle_key<'a>(
         _ => {}
     }
     Ok(())
+}
+
+/// Turns what was typed into a queue of files. A folder is walked; a single file is taken
+/// at its word, so a photograph with an extension imogen does not usually look for can
+/// still be sent by naming it.
+fn start_upload(app: &mut App, input: &str) {
+    let typed = input.trim();
+    if typed.is_empty() {
+        return;
+    }
+    let path = expand(typed);
+    if !path.exists() {
+        app.note(format!("{} is not there.", path.display()));
+        return;
+    }
+
+    let files = match crate::commands::upload::collect(std::slice::from_ref(&path), true) {
+        Ok(files) => files,
+        Err(error) => {
+            app.note(error.to_string());
+            return;
+        }
+    };
+    if files.is_empty() {
+        app.note(format!("Nothing to upload in {}.", path.display()));
+        return;
+    }
+
+    app.upload_total = files.len();
+    app.upload_done = 0;
+    app.upload_failed = 0;
+    app.uploaded_ids.clear();
+    app.upload_queue = files.into_iter().collect();
+    app.note(format!(
+        "Uploading {}…",
+        crate::output::plural(app.upload_total, "file")
+    ));
+}
+
+/// `~` is the shell's, not the filesystem's, and there is no shell here to expand it.
+fn expand(input: &str) -> PathBuf {
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    if input == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(input)
 }
 
 fn reload<'a>(ctx: &'a Context, app: &mut App, work: &mut FuturesUnordered<Job<'a>>) {

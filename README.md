@@ -183,8 +183,19 @@ With no arguments, imogen draws your library.
 | `/` | search |
 | `f` · `e` · `d` · `r` | favourite · archive · trash · restore |
 | `i` · `a` | details · albums |
+| `u` | upload a file or folder |
 | `1` `2` `3` `4` | library · favourites · archive · trash |
 | `g` `G` · `R` · `?` | first · last · reload · keys |
+
+`u` asks for a path. A folder is walked; a single file is taken at its word, so a
+photograph with an extension imogen does not usually look for can still be sent by naming
+it. `~` is expanded — there is no shell here to do it. Files go four at a time, the footer
+counts them off, and the grid reloads when the run ends so the new photographs appear where
+their dates put them rather than at the end. Upload while browsing an album and they are
+filed into it.
+
+For anything with metadata to carry — a date, a place, a caption — use `imogen upload` from
+the shell instead: the browser sends the files and nothing else.
 
 Photographs are drawn with the **Kitty graphics protocol** where the terminal has it —
 kitty, Ghostty, WezTerm, Konsole — and with half-block characters and 24-bit colour

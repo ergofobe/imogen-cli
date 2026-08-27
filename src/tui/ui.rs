@@ -162,7 +162,20 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.mode {
         Mode::Search(input) => format!(" search: {input}▏"),
+        Mode::Upload(input) => format!(" upload (file or folder): {input}▏"),
         Mode::Confirm { prompt, .. } => format!(" {prompt}  [y/N]"),
+        // A run in progress outranks whatever the last message was: it is the only thing
+        // on screen that is still changing.
+        _ if app.uploading() => format!(
+            " uploading {}/{}{}",
+            app.upload_done + app.upload_failed,
+            app.upload_total,
+            if app.upload_failed > 0 {
+                format!("  ({} failed)", app.upload_failed)
+            } else {
+                String::new()
+            }
+        ),
         _ => match &app.status {
             Some(status) => format!(" {status}"),
             None => match app.selected_asset() {
@@ -179,8 +192,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let style = match &app.mode {
-        Mode::Search(_) => Style::default().fg(ACCENT),
+        Mode::Search(_) | Mode::Upload(_) => Style::default().fg(ACCENT),
         Mode::Confirm { .. } => Style::default().fg(Color::Rgb(0xE0, 0x7A, 0x5F)),
+        _ if app.uploading() => Style::default().fg(ACCENT),
         _ => Style::default().fg(MUTED),
     };
     frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
@@ -406,6 +420,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("r", "restore from the trash"),
         ("i", "details"),
         ("a", "albums"),
+        ("u", "upload a file or folder"),
         ("1 2 3 4", "library · favourites · archive · trash"),
         ("g  G", "first · last"),
         ("R", "reload"),
