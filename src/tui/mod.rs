@@ -274,7 +274,7 @@ async fn upload_one(ctx: &Context, path: PathBuf) -> Loaded {
 async fn fill_album(ctx: &Context, album_id: String, ids: Vec<String>) -> Loaded {
     let mut added = 0u64;
     for chunk in ids.chunks(500) {
-        match ctx.client.albums.add_assets(&album_id, chunk).await {
+        match ctx.client.albums.add_assets(&album_id, &imogen_sdk::AssetSelection::ids(chunk)).await {
             Ok(result) => added += result.added,
             Err(error) => return Loaded::Filed(Err(error.into())),
         }
@@ -549,7 +549,7 @@ async fn handle_key<'a>(
         if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
             match action {
                 Action::Trash(ids) => {
-                    match ctx.client.assets.trash(&ids).await {
+                    match ctx.client.assets.trash(&imogen_sdk::AssetSelection::ids(&ids)).await {
                         Ok(result) => {
                             app.note(format!("{} moved to the trash.", result.count));
                             reload(ctx, app, work);
@@ -558,7 +558,7 @@ async fn handle_key<'a>(
                     };
                 }
                 Action::Restore(ids) => {
-                    match ctx.client.assets.restore(&ids).await {
+                    match ctx.client.assets.restore(&imogen_sdk::AssetSelection::ids(&ids)).await {
                         Ok(result) => {
                             app.note(format!("{} restored.", result.count));
                             reload(ctx, app, work);

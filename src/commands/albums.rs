@@ -1,7 +1,7 @@
 //! Albums, and the links that publish them.
 
 use anyhow::Result;
-use imogen_sdk::{AlbumCreate, AlbumUpdate};
+use imogen_sdk::{AlbumCreate, AlbumUpdate, AssetSelection};
 use serde_json::json;
 
 use crate::cli::{AlbumCommand, QueryArgs};
@@ -193,7 +193,7 @@ async fn add(ctx: &Context, reference: &str, assets: &[String], query: &QueryArg
     let mut skipped = 0u64;
     let mut count = 0u64;
     for chunk in ids.chunks(500) {
-        let result = ctx.client.albums.add_assets(&album.id, chunk).await?;
+        let result = ctx.client.albums.add_assets(&album.id, &AssetSelection::ids(chunk)).await?;
         added += result.added;
         skipped += result.skipped;
         count = result.asset_count;
@@ -222,7 +222,7 @@ async fn add(ctx: &Context, reference: &str, assets: &[String], query: &QueryArg
 
 async fn remove(ctx: &Context, reference: &str, assets: &[String]) -> Result<()> {
     let album = ctx.find_album(reference).await?;
-    let result = ctx.client.albums.remove_assets(&album.id, assets).await?;
+    let result = ctx.client.albums.remove_assets(&album.id, &AssetSelection::ids(assets)).await?;
     if ctx.out.is_json() {
         return ctx.out.json(&result);
     }

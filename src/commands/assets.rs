@@ -1,7 +1,7 @@
 //! Listing, showing, editing and trashing photographs.
 
 use anyhow::{bail, Result};
-use imogen_sdk::{Asset, AssetStatus, AssetType, AssetUpdate, GeoPoint};
+use imogen_sdk::{Asset, AssetSelection, AssetStatus, AssetType, AssetUpdate, GeoPoint, TimelineQuery};
 use serde_json::json;
 
 use crate::cli::{EditArgs, ListArgs, RestoreArgs, SearchArgs, ShowArgs, TrashArgs};
@@ -287,7 +287,7 @@ pub async fn stats(ctx: &Context) -> Result<()> {
 }
 
 pub async fn timeline(ctx: &Context, after: Option<&str>, before: Option<&str>) -> Result<()> {
-    let timeline = ctx.client.assets.timeline().await?;
+    let timeline = ctx.client.assets.timeline(&TimelineQuery::default()).await?;
     let buckets: Vec<_> = timeline
         .buckets
         .into_iter()
@@ -435,7 +435,7 @@ pub async fn trash(ctx: &Context, args: &TrashArgs) -> Result<()> {
         return Ok(());
     }
 
-    let result = ctx.client.assets.trash(&targets).await?;
+    let result = ctx.client.assets.trash(&AssetSelection::ids(&targets)).await?;
     if ctx.out.is_json() {
         return ctx.out.json(&result);
     }
@@ -475,7 +475,7 @@ pub async fn restore(ctx: &Context, args: &RestoreArgs) -> Result<()> {
         args.ids.clone()
     };
 
-    let result = ctx.client.assets.restore(&targets).await?;
+    let result = ctx.client.assets.restore(&AssetSelection::ids(&targets)).await?;
     if ctx.out.is_json() {
         return ctx.out.json(&result);
     }

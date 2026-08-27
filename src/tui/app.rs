@@ -198,6 +198,7 @@ impl App {
             q: (!self.query.is_empty()).then(|| self.query.clone()),
             r#type: None,
             album_id: self.album.as_ref().map(|album| album.id.clone()),
+            person_id: None,
             favorite: (self.scope == Scope::Favorites).then_some(true),
             archived: (self.scope == Scope::Archived).then_some(true),
             trashed: (self.scope == Scope::Trash).then_some(true),
