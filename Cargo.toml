@@ -1,0 +1,47 @@
+[package]
+name = "imogen-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Command-line client and terminal browser for the imogen photo library"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ergofobe/imogen-cli"
+keywords = ["imogen", "photos", "self-hosted", "cli", "tui"]
+categories = ["command-line-utilities", "multimedia::images"]
+readme = "README.md"
+
+[[bin]]
+name = "imogen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.5"
+crossterm = "0.28"
+dirs = "5"
+futures = "0.3"
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+  "gif",
+] }
+imogen-sdk = { path = "../imogen-sdk/rust" }
+indicatif = "0.17"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "sync", "signal"] }
+unicode-width = "0.2"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Only so the default SIGPIPE handler can be restored: Rust ignores SIGPIPE, which turns
+# `imogen ls | head` into a panic instead of a quiet exit.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
