@@ -168,6 +168,10 @@ jobs:
           mkdir -p dist
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \) \
             -exec mv {} dist/ \;
+          # The installer is published with the release as well as living on main, so a
+          # `--version` install of an old one fetches the script that matches it — and is
+          # checksummed with everything else, so it can be verified before being run.
+          cp install.sh dist/install.sh
           cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:

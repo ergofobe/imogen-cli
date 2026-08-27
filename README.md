@@ -270,30 +270,52 @@ imogen --json upload --manifest - --report /tmp/done.jsonl < manifest.jsonl
 
 ## Installing
 
-Every tagged release carries binaries for Linux and macOS, built by
-[the release workflow](.github/workflows/release.yml).
+```bash
+curl -fsSL https://raw.githubusercontent.com/ergofobe/imogen-cli/main/install.sh | sh
+```
 
-**Linux** — `.deb`, `.rpm`, or a tarball. The binaries are statically linked against musl,
-so one build runs on any distribution regardless of its glibc.
+That works out which machine it is on, downloads the matching build, checks it against the
+release's own `SHA256SUMS`, and puts the binary in `~/.local/bin` with its completions and
+man page beside it. No root, no package manager, nothing to uninstall but the files it
+names.
+
+Read it first if you would rather —
+[`install.sh`](install.sh) is one file and does nothing clever.
+
+| | |
+|---|---|
+| `--version v0.2.0` | install a particular release rather than the newest |
+| `--prefix /usr/local` | somewhere other than `~/.local` |
+| `--deb` · `--rpm` | let the system package manager own it (Linux, uses `sudo`) |
+| `--no-verify` | skip the checksum check. Don't. |
+
+The same options can be given as `IMOGEN_VERSION` and `IMOGEN_PREFIX`, and
+`IMOGEN_DOWNLOAD_BASE` points the whole thing at a mirror.
+
+### Or by hand
+
+Every tagged release carries binaries built by
+[the release workflow](.github/workflows/release.yml):
+
+- **Linux** — `.deb`, `.rpm`, and a tarball, for x86_64 and aarch64. The binaries are
+  statically linked against musl, so one build runs on any distribution whatever its
+  glibc.
+- **macOS** — a tarball per architecture, and a universal one that runs on both.
 
 ```bash
 sudo dpkg -i imogen-cli_*_amd64.deb          # Debian, Ubuntu
 sudo rpm -i imogen-cli-*.x86_64.rpm          # Fedora, RHEL, openSUSE
-```
 
-**macOS** — a tarball per architecture, and a universal one that runs on both.
-
-```bash
 tar -xzf imogen-universal-apple-darwin.tar.gz
 cd imogen-universal-apple-darwin && ./install.sh
 ```
 
-`install.sh` puts the binary in `~/.local/bin` and the completions and man page beside it;
-set `PREFIX` to put them somewhere else. The packages carry the same things, in the places
-a shell and `man` already look — so `imogen <tab>` and `man imogen` work after installing.
+Each tarball carries its own `install.sh`, which does the same as the one above without
+downloading anything. The packages put the binary, completions and man page where a shell
+and `man` already look, so `imogen <tab>` and `man imogen` work once either is installed.
 
-Nothing is signed or notarised, so macOS will want the quarantine attribute cleared:
-`xattr -d com.apple.quarantine imogen`.
+Nothing is signed or notarised, so macOS will want the quarantine attribute cleared before
+a downloaded binary will run: `xattr -d com.apple.quarantine imogen`.
 
 ## Building
 
