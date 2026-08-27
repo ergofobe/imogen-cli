@@ -115,18 +115,8 @@ async fn event_loop(ctx: &Context) -> Result<()> {
                 )));
             }
         }
-        if app.mode == Mode::Viewer {
-            if let Some(asset) = app.selected_asset() {
-                let id = asset.id.clone();
-                let have = app
-                    .preview
-                    .as_ref()
-                    .map(|(held, _)| held == &id)
-                    .unwrap_or(false);
-                if !have && app.wanted.insert(format!("preview:{id}")) {
-                    work.push(Box::pin(load_bytes(ctx, id, AssetVariant::Preview, true)));
-                }
-            }
+        if let Some(id) = viewer_preview_wanted(&mut app) {
+            work.push(Box::pin(load_bytes(ctx, id, AssetVariant::Preview, true)));
         }
         if app.wants_more() {
             app.loading = true;
@@ -224,6 +214,22 @@ async fn load_asset(ctx: &Context, id: String) -> Loaded {
 
 async fn load_albums(ctx: &Context) -> Loaded {
     Loaded::Albums(ctx.client.albums.list().await.map_err(Into::into))
+}
+
+/// The preview the viewer needs: the selected photograph's, when it is not already held
+/// and not already on its way. Marks it as on its way, so a caller asks exactly once.
+fn viewer_preview_wanted(app: &mut App) -> Option<String> {
+    if app.mode != Mode::Viewer {
+        return None;
+    }
+    let id = app.selected_asset()?.id.clone();
+    if app.preview_for(&id).is_some() {
+        return None;
+    }
+    if !app.preview_inflight.insert(id.clone()) {
+        return None;
+    }
+    Some(id)
 }
 
 /// The file under the picker's cursor, when it is one worth trying to draw.
@@ -331,12 +337,20 @@ fn absorb(app: &mut App, loaded: Loaded) {
         // retried: whatever is wrong with it will still be wrong next time.
         Loaded::Thumbnail(_, Err(_)) => {}
         Loaded::Preview(id, Ok(bytes)) => {
-            if let Ok(image) = media::decode(&bytes) {
-                app.preview = Some((id, Arc::new(image)));
-                app.images_dirty = true;
+            app.preview_inflight.remove(&id);
+            match media::decode(&bytes) {
+                Ok(image) => {
+                    app.remember_preview(id, Arc::new(image));
+                    app.images_dirty = true;
+                }
+                // Saying so beats a "Loading…" that never finishes.
+                Err(error) => app.note(format!("Could not draw it: {error}")),
             }
         }
-        Loaded::Preview(_, Err(error)) => app.note(format!("Could not load: {error}")),
+        Loaded::Preview(id, Err(error)) => {
+            app.preview_inflight.remove(&id);
+            app.note(format!("Could not load: {error}"));
+        }
         Loaded::Page(Ok(page)) => {
             app.loading = false;
             if app.total.is_none() {
@@ -409,13 +423,17 @@ fn place_images(app: &App) -> Result<()> {
             }
         }
     } else if app.mode == Mode::Viewer {
-        if let (Some((_, image)), Some(tile)) = (&app.preview, app.tiles.first()) {
-            let (cols, rows) = fit(image, tile.inner.width, tile.inner.height);
-            // Centre it in the pane rather than pinning it to the corner.
-            let x = tile.inner.x + (tile.inner.width.saturating_sub(cols)) / 2;
-            let y = tile.inner.y + (tile.inner.height.saturating_sub(rows)) / 2;
-            if let Ok(escape) = media::place_at(image, x, y, cols, rows) {
-                write!(out, "{escape}")?;
+        // Matched against the asset on screen: a preview that arrives after you have moved
+        // on belongs to the photograph it was asked for, not to whichever one is showing.
+        if let (Some(asset), Some(tile)) = (app.selected_asset(), app.tiles.first()) {
+            if let Some(image) = app.preview_for(&asset.id) {
+                let (cols, rows) = fit(image, tile.inner.width, tile.inner.height);
+                // Centre it in the pane rather than pinning it to the corner.
+                let x = tile.inner.x + (tile.inner.width.saturating_sub(cols)) / 2;
+                let y = tile.inner.y + (tile.inner.height.saturating_sub(rows)) / 2;
+                if let Ok(escape) = media::place_at(image, x, y, cols, rows) {
+                    write!(out, "{escape}")?;
+                }
             }
         }
     } else {
@@ -865,5 +883,164 @@ async fn toggle(ctx: &Context, app: &mut App, which: impl Toggle) {
             app.note(message);
         }
         Err(error) => app.note(format!("Could not change it: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::Tile;
+    use imogen_sdk::{Asset, AssetStatus, AssetType};
+    use ratatui::layout::Rect;
+
+    fn png_bytes() -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::new(4, 4));
+        let mut out = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn asset(id: &str) -> Asset {
+        Asset {
+            id: id.into(),
+            owner_id: "owner".into(),
+            r#type: AssetType::Image,
+            status: AssetStatus::Ready,
+            original_filename: "photo.jpg".into(),
+            mime_type: "image/jpeg".into(),
+            checksum: "c".repeat(64),
+            size_bytes: 1,
+            width: None,
+            height: None,
+            duration: None,
+            captured_at: "2024-06-01T09:30:00.000Z".into(),
+            captured_at_is_exact: false,
+            captured_at_original: None,
+            captured_at_original_is_exact: None,
+            created_at: "2024-06-01T09:30:00.000Z".into(),
+            updated_at: "2024-06-01T09:30:00.000Z".into(),
+            deleted_at: None,
+            favorite: false,
+            archived: false,
+            description: None,
+            exif: None,
+            location: None,
+            placeholder_color: None,
+            live_photo_video_id: None,
+            device_asset_id: None,
+        }
+    }
+
+    fn viewing(ids: &[&str]) -> App {
+        let mut app = App::new();
+        app.assets = ids.iter().map(|id| asset(id)).collect();
+        app.tiles = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| Tile {
+                id: (*id).into(),
+                inner: Rect::default(),
+                index,
+            })
+            .collect();
+        app.mode = Mode::Viewer;
+        app
+    }
+
+    /// The reported bug, through the real request decision and the real absorb: view one,
+    /// move to the next, come back — and the first must still appear. It did not, because
+    /// the note that it had been asked for outlived the picture it was asked for.
+    #[test]
+    fn coming_back_to_a_photograph_shows_it_again() {
+        let mut app = viewing(&["a", "b"]);
+
+        assert_eq!(viewer_preview_wanted(&mut app).as_deref(), Some("a"));
+        absorb(&mut app, Loaded::Preview("a".into(), Ok(png_bytes())));
+        assert!(app.preview_for("a").is_some());
+
+        app.move_by(1);
+        assert_eq!(viewer_preview_wanted(&mut app).as_deref(), Some("b"));
+        absorb(&mut app, Loaded::Preview("b".into(), Ok(png_bytes())));
+
+        app.move_by(-1);
+        assert!(
+            app.preview_for("a").is_some(),
+            "still held, so it draws at once"
+        );
+        assert_eq!(
+            viewer_preview_wanted(&mut app),
+            None,
+            "and is not asked for again"
+        );
+    }
+
+    /// Stepping through faster than the answers come back must not leave every photograph
+    /// marked as asked-for with nothing to show.
+    #[test]
+    fn stepping_through_quickly_still_ends_with_pictures() {
+        let ids = ["a", "b", "c", "d"];
+        let mut app = viewing(&ids);
+
+        // Ask for each in turn without waiting, as somebody holding a key down would.
+        let mut asked = Vec::new();
+        for step in 0..ids.len() {
+            if let Some(id) = viewer_preview_wanted(&mut app) {
+                asked.push(id);
+            }
+            if step + 1 < ids.len() {
+                app.move_by(1);
+            }
+        }
+        assert_eq!(asked.len(), 4, "each was asked for once");
+
+        // The answers arrive afterwards, in any order.
+        for id in ["c", "a", "d", "b"] {
+            absorb(&mut app, Loaded::Preview(id.into(), Ok(png_bytes())));
+        }
+        for id in ids {
+            assert!(app.preview_for(id).is_some(), "{id} should be there");
+        }
+        assert!(
+            app.preview_inflight.is_empty(),
+            "nothing left marked as pending"
+        );
+    }
+
+    #[test]
+    fn a_refused_request_clears_the_mark_so_it_can_be_retried() {
+        let mut app = viewing(&["a"]);
+        assert_eq!(viewer_preview_wanted(&mut app).as_deref(), Some("a"));
+
+        absorb(
+            &mut app,
+            Loaded::Preview("a".into(), Err(anyhow::anyhow!("network went away"))),
+        );
+        assert!(app.preview_inflight.is_empty());
+        assert_eq!(viewer_preview_wanted(&mut app).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn bytes_that_will_not_decode_say_so_rather_than_loading_for_ever() {
+        let mut app = viewing(&["a"]);
+        viewer_preview_wanted(&mut app);
+        absorb(
+            &mut app,
+            Loaded::Preview("a".into(), Ok(b"not an image".to_vec())),
+        );
+
+        assert!(app.preview_for("a").is_none());
+        assert!(
+            app.status.is_some(),
+            "the viewer must say something went wrong"
+        );
+    }
+
+    #[test]
+    fn nothing_is_asked_for_outside_the_viewer() {
+        let mut app = viewing(&["a"]);
+        app.mode = Mode::Grid;
+        assert_eq!(viewer_preview_wanted(&mut app), None);
     }
 }

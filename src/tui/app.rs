@@ -67,6 +67,10 @@ pub struct Tile {
     pub index: usize,
 }
 
+/// How many viewer-sized pictures to keep. Enough that stepping back and forth over a few
+/// photographs is instant, few enough that the memory stays bounded.
+pub const PREVIEW_CACHE: usize = 8;
+
 pub struct App {
     pub assets: Vec<Asset>,
     pub cursor: Option<String>,
@@ -85,8 +89,15 @@ pub struct App {
     /// Assets whose status is being re-checked, so the same one is not asked for twice
     /// while an answer is still on its way.
     pub refreshing: HashSet<String>,
-    /// The picture shown in the viewer, which is a larger rendition than the grid's.
-    pub preview: Option<(String, Arc<DynamicImage>)>,
+    /// Previews for the viewer — a larger rendition than the grid's, so they are kept a
+    /// handful at a time rather than for the whole library. Keyed by asset, because a
+    /// single slot cannot answer "have I already got this one?" once you have moved on.
+    pub previews: HashMap<String, Arc<DynamicImage>>,
+    /// Insertion order, for evicting the least recently added.
+    pub preview_order: VecDeque<String>,
+    /// Previews currently being fetched. Emptied as each answer arrives, so a second look
+    /// at the same photograph asks again rather than waiting for a request that is over.
+    pub preview_inflight: HashSet<String>,
 
     /// The file picker, alive only while it is open.
     pub picker: Option<crate::tui::picker::Picker>,
@@ -145,7 +156,9 @@ impl App {
             thumbnails: HashMap::new(),
             wanted: HashSet::new(),
             refreshing: HashSet::new(),
-            preview: None,
+            previews: HashMap::new(),
+            preview_order: VecDeque::new(),
+            preview_inflight: HashSet::new(),
             grid_area: Rect::default(),
             tiles: Vec::new(),
             columns: 1,
@@ -203,7 +216,6 @@ impl App {
         self.cursor = None;
         self.selected = 0;
         self.scroll = 0;
-        self.preview = None;
         self.images_dirty = true;
     }
 
@@ -219,7 +231,6 @@ impl App {
         let next = (self.selected as isize + delta).clamp(0, last) as usize;
         if next != self.selected {
             self.selected = next;
-            self.preview = None;
             self.keep_selection_visible();
             self.images_dirty = true;
         }
@@ -281,17 +292,33 @@ impl App {
         if now_ready && !was_ready {
             self.thumbnails.remove(&id);
             self.wanted.remove(&id);
-            self.wanted.remove(&format!("preview:{id}"));
-            if self
-                .preview
-                .as_ref()
-                .map(|(held, _)| held == &id)
-                .unwrap_or(false)
-            {
-                self.preview = None;
-            }
+            self.forget_preview(&id);
             self.images_dirty = true;
         }
+    }
+
+    pub fn preview_for(&self, id: &str) -> Option<&Arc<DynamicImage>> {
+        self.previews.get(id)
+    }
+
+    /// Keeps a preview, dropping the oldest once there are more than a handful. A preview
+    /// is a 1440-pixel rendition; holding one per photograph would grow without limit on
+    /// a library worth having.
+    pub fn remember_preview(&mut self, id: String, image: Arc<DynamicImage>) {
+        if self.previews.insert(id.clone(), image).is_none() {
+            self.preview_order.push_back(id);
+        }
+        while self.preview_order.len() > PREVIEW_CACHE {
+            if let Some(oldest) = self.preview_order.pop_front() {
+                self.previews.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn forget_preview(&mut self, id: &str) {
+        self.previews.remove(id);
+        self.preview_order.retain(|held| held != id);
+        self.preview_inflight.remove(id);
     }
 
     pub fn note(&mut self, message: impl Into<String>) {
@@ -408,6 +435,141 @@ mod tests {
             "but the next tick must be free to ask"
         );
         assert_eq!(app.pending_on_screen(), vec!["a".to_string()]);
+    }
+
+    fn dummy_image() -> Arc<DynamicImage> {
+        Arc::new(DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2)))
+    }
+
+    /// What the event loop does each pass: ask for the selected photograph's preview if it
+    /// is not already held and not already on its way. Returns whether a request was made.
+    fn tick_viewer(app: &mut App) -> bool {
+        let id = app.selected_asset().map(|a| a.id.clone()).unwrap();
+        if app.preview_for(&id).is_none() && app.preview_inflight.insert(id) {
+            return true;
+        }
+        false
+    }
+
+    fn arrives(app: &mut App, id: &str) {
+        app.preview_inflight.remove(id);
+        app.remember_preview(id.to_string(), dummy_image());
+    }
+
+    #[test]
+    fn looking_at_a_photograph_a_second_time_loads_it_again() {
+        // The bug: the record of "already asked for" outlived the picture itself, so
+        // coming back to a photograph left the viewer saying "Loading…" for ever.
+        let mut app = App::new();
+        app.assets = vec![
+            asset("a", AssetStatus::Ready),
+            asset("b", AssetStatus::Ready),
+        ];
+        app.tiles = vec![
+            Tile {
+                id: "a".into(),
+                inner: Rect::default(),
+                index: 0,
+            },
+            Tile {
+                id: "b".into(),
+                inner: Rect::default(),
+                index: 1,
+            },
+        ];
+        app.mode = Mode::Viewer;
+
+        assert!(tick_viewer(&mut app), "asks for the first one");
+        arrives(&mut app, "a");
+        assert!(app.preview_for("a").is_some());
+
+        app.move_by(1);
+        assert!(tick_viewer(&mut app), "asks for the second");
+        arrives(&mut app, "b");
+
+        app.move_by(-1);
+        // Held from before, so nothing is asked for and the picture is there at once.
+        assert!(!tick_viewer(&mut app));
+        assert!(
+            app.preview_for("a").is_some(),
+            "the first one is still held"
+        );
+    }
+
+    #[test]
+    fn a_photograph_dropped_from_the_cache_is_asked_for_again() {
+        let mut app = App::new();
+        app.assets = vec![asset("a", AssetStatus::Ready)];
+        app.tiles = vec![Tile {
+            id: "a".into(),
+            inner: Rect::default(),
+            index: 0,
+        }];
+        app.mode = Mode::Viewer;
+
+        assert!(tick_viewer(&mut app));
+        arrives(&mut app, "a");
+
+        // Enough other photographs to push it out.
+        for n in 0..PREVIEW_CACHE {
+            app.remember_preview(format!("other{n}"), dummy_image());
+        }
+        assert!(app.preview_for("a").is_none(), "evicted");
+        assert!(
+            tick_viewer(&mut app),
+            "and so asked for again, not left blank"
+        );
+    }
+
+    #[test]
+    fn the_cache_stays_bounded() {
+        let mut app = App::new();
+        for n in 0..(PREVIEW_CACHE * 3) {
+            app.remember_preview(format!("id{n}"), dummy_image());
+        }
+        assert_eq!(app.previews.len(), PREVIEW_CACHE);
+        assert_eq!(app.preview_order.len(), PREVIEW_CACHE);
+        // The newest survive; the oldest are gone.
+        assert!(app
+            .preview_for(&format!("id{}", PREVIEW_CACHE * 3 - 1))
+            .is_some());
+        assert!(app.preview_for("id0").is_none());
+    }
+
+    #[test]
+    fn holding_the_same_one_twice_does_not_grow_the_cache() {
+        let mut app = App::new();
+        app.remember_preview("a".into(), dummy_image());
+        app.remember_preview("a".into(), dummy_image());
+        assert_eq!(app.previews.len(), 1);
+        assert_eq!(
+            app.preview_order.len(),
+            1,
+            "the order must not gain a duplicate"
+        );
+    }
+
+    #[test]
+    fn a_request_that_fails_can_be_made_again() {
+        // Every answer clears the in-flight mark, including a refusal, so a photograph
+        // that failed once is not written off for the rest of the session.
+        let mut app = App::new();
+        app.assets = vec![asset("a", AssetStatus::Ready)];
+        app.tiles = vec![Tile {
+            id: "a".into(),
+            inner: Rect::default(),
+            index: 0,
+        }];
+        app.mode = Mode::Viewer;
+
+        assert!(tick_viewer(&mut app));
+        assert!(
+            !tick_viewer(&mut app),
+            "not asked for twice while in flight"
+        );
+
+        app.preview_inflight.remove("a"); // the request failed
+        assert!(tick_viewer(&mut app), "and may be asked for again");
     }
 
     #[test]

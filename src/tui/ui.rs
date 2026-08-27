@@ -339,7 +339,11 @@ fn draw_viewer(frame: &mut Frame, app: &App, area: Rect) {
             .title(Span::styled(title, Style::default().fg(ACCENT))),
         area,
     );
-    if app.preview.is_none() {
+    let showing = app
+        .selected_asset()
+        .map(|asset| app.preview_for(&asset.id).is_some())
+        .unwrap_or(false);
+    if !showing {
         frame.render_widget(
             Paragraph::new("Loading…")
                 .style(Style::default().fg(MUTED))
