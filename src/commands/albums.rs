@@ -1,6 +1,6 @@
 //! Albums, and the links that publish them.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use imogen_sdk::{AlbumCreate, AlbumUpdate, AssetFilter, AssetSelection};
 use serde_json::json;
 
@@ -201,24 +201,54 @@ async fn delete(ctx: &Context, reference: &str, yes: bool) -> Result<()> {
 
 async fn add(ctx: &Context, reference: &str, assets: &[String], query: &QueryArgs) -> Result<()> {
     let album = ctx.find_album(reference).await?;
-    let ids = ctx.select(assets, query, None).await?;
-    if ids.is_empty() {
+
+    if !assets.is_empty() {
+        let mut added = 0u64;
+        let mut skipped = 0u64;
+        let mut count = 0u64;
+        for chunk in assets.chunks(500) {
+            let result = ctx
+                .client
+                .albums
+                .add_assets(&album.id, &AssetSelection::ids(chunk))
+                .await?;
+            added += result.added;
+            skipped += result.skipped;
+            count = result.asset_count;
+        }
+        return report_added(ctx, &album.name, added, skipped, count);
+    }
+    if query.is_empty() {
+        bail!("Name some asset ids, or give a filter such as --query or --album");
+    }
+
+    let filter = ctx.to_filter(query).await?;
+    let matched = ctx.count(&filter).await?;
+    if matched == 0 {
         ctx.out.note("Nothing matched.");
         return Ok(());
     }
-    let mut added = 0u64;
-    let mut skipped = 0u64;
-    let mut count = 0u64;
-    for chunk in ids.chunks(500) {
-        let result = ctx
-            .client
-            .albums
-            .add_assets(&album.id, &AssetSelection::ids(chunk))
-            .await?;
-        added += result.added;
-        skipped += result.skipped;
-        count = result.asset_count;
-    }
+    let result = ctx
+        .client
+        .albums
+        .add_assets(
+            &album.id,
+            &AssetSelection {
+                query: Some(filter),
+                ..Default::default()
+            },
+        )
+        .await?;
+    report_added(
+        ctx,
+        &album.name,
+        result.added,
+        result.skipped,
+        result.asset_count,
+    )
+}
+
+fn report_added(ctx: &Context, name: &str, added: u64, skipped: u64, count: u64) -> Result<()> {
     if ctx.out.is_json() {
         return ctx.out.json(&json!({
             "added": added,
@@ -228,8 +258,7 @@ async fn add(ctx: &Context, reference: &str, assets: &[String], query: &QueryArg
     }
     ctx.out.note(ctx.out.paint(
         &format!(
-            "Added {added} to “{}”{}.",
-            album.name,
+            "Added {added} to “{name}”{}.",
             if skipped > 0 {
                 format!(", {skipped} were already in it")
             } else {
@@ -242,18 +271,26 @@ async fn add(ctx: &Context, reference: &str, assets: &[String], query: &QueryArg
 }
 
 async fn remove(ctx: &Context, reference: &str, assets: &[String]) -> Result<()> {
-    let album = ctx.find_album(reference).await?;
-    let result = ctx
-        .client
-        .albums
-        .remove_assets(&album.id, &AssetSelection::ids(assets))
-        .await?;
-    if ctx.out.is_json() {
-        return ctx.out.json(&result);
+    if assets.is_empty() {
+        ctx.out.note("Nothing matched.");
+        return Ok(());
     }
-    ctx.out.note(ctx.out.paint(
-        &format!("Took {} out of “{}”.", result.removed, album.name),
-        GREEN,
-    ));
+    let album = ctx.find_album(reference).await?;
+    let mut removed = 0u64;
+    for chunk in assets.chunks(500) {
+        let result = ctx
+            .client
+            .albums
+            .remove_assets(&album.id, &AssetSelection::ids(chunk))
+            .await?;
+        removed += result.removed;
+    }
+    if ctx.out.is_json() {
+        return ctx.out.json(&json!({ "removed": removed }));
+    }
+    ctx.out.note(
+        ctx.out
+            .paint(&format!("Took {removed} out of “{}”.", album.name), GREEN),
+    );
     Ok(())
 }
