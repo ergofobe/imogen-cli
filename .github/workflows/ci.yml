@@ -20,13 +20,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      # The client library is a path dependency, so it has to be on disk beside this one.
-      - uses: actions/checkout@v5
         with:
-          repository: ergofobe/imogen-sdk
-          path: imogen-sdk-checkout
-      - name: Put the SDK where Cargo expects it
-        run: mv imogen-sdk-checkout ../imogen-sdk
+          # The client library is a submodule, so the commit being tested names the SDK
+          # commit it is tested against: re-running an old commit builds what it built.
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

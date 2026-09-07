@@ -1,8 +1,7 @@
 # Contributing
 
 ```bash
-git clone https://github.com/ergofobe/imogen-sdk    # a path dependency, beside this one
-git clone https://github.com/ergofobe/imogen-cli
+git clone --recurse-submodules https://github.com/ergofobe/imogen-cli
 cd imogen-cli
 
 cargo build
@@ -12,9 +11,25 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The client library lives in [imogen-sdk](https://github.com/ergofobe/imogen-sdk) and is
-referenced by path, so the two repositories are checked out side by side. Anything that
-touches the wire — a new endpoint, a new field — belongs there rather than here: this
-program should contain no knowledge of HTTP at all.
+vendored as a submodule at `imogen-sdk/`, so every commit here names the SDK commit it was
+built and tested against. A clone made without `--recurse-submodules` — and any `git
+worktree add`, which never populates submodules — leaves that directory empty and the build
+unable to resolve the dependency:
+
+```bash
+git submodule update --init --recursive
+```
+
+Moving to a newer SDK is a commit like any other, and belongs in the pull request that needs
+it:
+
+```bash
+git -C imogen-sdk fetch origin && git -C imogen-sdk checkout origin/main
+cargo test && git add imogen-sdk Cargo.lock
+```
+
+Anything that touches the wire — a new endpoint, a new field — belongs there rather than
+here: this program should contain no knowledge of HTTP at all.
 
 ## What to keep in mind
 
