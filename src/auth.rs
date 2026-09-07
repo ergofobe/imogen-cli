@@ -139,7 +139,7 @@ pub async fn browser_login(
         .await
         .with_context(|| format!("{server} would not register this machine"))?;
     let pending = oauth
-        .begin_authorization(&client.client_id, &redirect_uri, scopes)
+        .begin_authorization(&client.client_id, &redirect_uri, scopes, None)
         .await?;
 
     on_url(&pending.authorization_url);
