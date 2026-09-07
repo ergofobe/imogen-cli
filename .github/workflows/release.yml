@@ -6,11 +6,6 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      sdk_ref:
-        description: 'imogen-sdk ref to build against'
-        default: 'main'
-        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -35,15 +30,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/checkout@v5
         with:
-          repository: ergofobe/imogen-sdk
-          # A path dependency, not a crates.io one, so a release is built against a
-          # named ref of it. A tag build takes main; a dispatch may say otherwise.
-          ref: ${{ inputs.sdk_ref || 'main' }}
-          path: imogen-sdk-checkout
-      - name: Put the SDK where Cargo expects it
-        run: mv imogen-sdk-checkout ../imogen-sdk
+          # The SDK is a submodule, so the tag being released names the SDK commit it is
+          # built against. Nothing has to remember to pin it.
+          submodules: recursive
 
       # musl, so one binary runs on any distribution rather than on whichever glibc the
       # runner happened to have. Nothing here links OpenSSL — TLS is rustls — so a fully
@@ -106,15 +96,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/checkout@v5
         with:
-          repository: ergofobe/imogen-sdk
-          # A path dependency, not a crates.io one, so a release is built against a
-          # named ref of it. A tag build takes main; a dispatch may say otherwise.
-          ref: ${{ inputs.sdk_ref || 'main' }}
-          path: imogen-sdk-checkout
-      - name: Put the SDK where Cargo expects it
-        run: mv imogen-sdk-checkout ../imogen-sdk
+          # The SDK is a submodule, so the tag being released names the SDK commit it is
+          # built against. Nothing has to remember to pin it.
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -1,0 +1,3 @@
+[submodule "imogen-sdk"]
+	path = imogen-sdk
+	url = https://github.com/ergofobe/imogen-sdk.git

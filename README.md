@@ -340,12 +340,16 @@ a downloaded binary will run: `xattr -d com.apple.quarantine imogen`.
 ## Building
 
 ```bash
+git clone --recurse-submodules https://github.com/ergofobe/imogen-cli
+cd imogen-cli
 cargo build --release
 ```
 
-The client library is [imogen-sdk](https://github.com/ergofobe/imogen-sdk), referenced by
-path, so check it out beside this repository. Everything that touches the wire lives there;
-this program contains no HTTP at all.
+The client library is [imogen-sdk](https://github.com/ergofobe/imogen-sdk), vendored as a
+submodule at `imogen-sdk/` and pinned to the commit this one is built against — so a clone
+without `--recurse-submodules` needs `git submodule update --init --recursive` before it
+will build. Everything that touches the wire lives there; this program contains no HTTP at
+all.
 
 ## Licence
 
