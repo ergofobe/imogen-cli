@@ -20,13 +20,19 @@ unable to resolve the dependency:
 git submodule update --init --recursive
 ```
 
-Moving to a newer SDK is a commit like any other, and belongs in the pull request that needs
-it:
+Changing the SDK means committing and merging there first, then bumping the pointer here —
+CI fetches the submodule by commit, so a pointer at something that was never pushed fails
+with `did not contain <sha>` however well it built on your machine. Moving to a newer SDK is
+then a commit like any other, and belongs in the pull request that needs it:
 
 ```bash
 git -C imogen-sdk fetch origin && git -C imogen-sdk checkout origin/main
-cargo test && git add imogen-sdk Cargo.lock
+cargo test --locked      # a version bump there changes Cargo.lock here
+git add imogen-sdk Cargo.lock && git commit -m "Move to the current SDK"
 ```
+
+`--locked` is what CI runs, so the lockfile has to be committed alongside the pointer rather
+than regenerated on the runner.
 
 Anything that touches the wire — a new endpoint, a new field — belongs there rather than
 here: this program should contain no knowledge of HTTP at all.

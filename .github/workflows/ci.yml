@@ -31,8 +31,11 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+      # --locked everywhere above, so a submodule bump that left Cargo.lock behind fails
+      # here rather than at the next tag — the release build is the only thing that used
+      # to pass it, and by then the stale lockfile is already on main.
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
