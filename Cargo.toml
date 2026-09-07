@@ -30,7 +30,7 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "bmp",
 ] }
-imogen-sdk = { path = "../imogen-sdk/rust" }
+imogen-sdk = { path = "imogen-sdk/rust" }
 indicatif = "0.17"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
