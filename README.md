@@ -161,6 +161,16 @@ imogen admin    users · invites · queue · clients · sessions · storage · s
 `imogen <command> --help` describes each. `imogen completions <shell>` prints a completion
 script.
 
+### The vault is not here, on purpose
+
+There is no `imogen vault`. The vault opens only for a signed-in browser session: unlocking
+mints a proof bound to that session, and an API token has no session to bind to. The server
+refuses every vault route to a bearer token, and its tests pin that refusal — an API token is
+not a person, so it can never satisfy a re-authentication.
+
+So the vault is reachable from the web interface and nowhere else. That is a deliberate
+property of where the passphrase is re-entered, not a gap waiting to be filled.
+
 ---
 
 ## The terminal browser
