@@ -10,6 +10,8 @@ mod media;
 mod output;
 mod tui;
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 
@@ -56,17 +58,56 @@ fn restore_sigpipe() {}
 /// Failures are reported the same way the command would have answered, so a script running
 /// with `--json` gets an error it can read rather than prose on stderr.
 fn report(out: &Output, error: &anyhow::Error) {
+    let details = api_details(error);
     if out.is_json() {
-        let _ = out.json(&serde_json::json!({
-            "error": error.to_string(),
-            "causes": error.chain().skip(1).map(|c| c.to_string()).collect::<Vec<_>>(),
-        }));
+        let _ = out.json(&error_json(error, details));
         return;
     }
     eprintln!("{}", out.paint(&format!("error: {error}"), RED));
+    for line in details.map(detail_lines).unwrap_or_default() {
+        eprintln!("  {line}");
+    }
     for cause in error.chain().skip(1) {
         eprintln!("  {}", out.dim(&format!("caused by: {cause}")));
     }
+}
+
+/// The `path -> messages` map the server sent with a rejection, looked for all the way
+/// down the chain: a command that added its own context leaves the SDK error underneath it.
+fn api_details(error: &anyhow::Error) -> Option<&BTreeMap<String, Vec<String>>> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<imogen_sdk::Error>())
+        .and_then(imogen_sdk::Error::details)
+}
+
+/// One line per complaint rather than per field, so a field the server faults twice reads
+/// as two statements instead of one run-on.
+fn detail_lines(details: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    details
+        .iter()
+        .flat_map(|(path, messages)| {
+            messages
+                .iter()
+                .map(move |message| format!("{path}: {message}"))
+        })
+        .collect()
+}
+
+/// The key is absent rather than empty when the server named no fields, because `details`
+/// here is the API's own optional map and not something this program invented.
+fn error_json(
+    error: &anyhow::Error,
+    details: Option<&BTreeMap<String, Vec<String>>>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "error": error.to_string(),
+        "causes": error.chain().skip(1).map(|c| c.to_string()).collect::<Vec<_>>(),
+    });
+    if let Some(details) = details {
+        value["details"] = serde_json::json!(details);
+    }
+    value
 }
 
 async fn run(cli: &Cli) -> Result<()> {
@@ -123,5 +164,68 @@ async fn run(cli: &Cli) -> Result<()> {
         | Some(Command::Logout { .. })
         | Some(Command::Profiles(_))
         | Some(Command::Completions { .. }) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rejected_by_the_server() -> imogen_sdk::Error {
+        let mut details = BTreeMap::new();
+        details.insert("assetIds.3".to_string(), vec!["Invalid UUID".to_string()]);
+        details.insert(
+            "limit".to_string(),
+            vec!["Too large".to_string(), "Must be an integer".to_string()],
+        );
+        imogen_sdk::Error::Api {
+            status: 400,
+            code: "validation_failed".to_string(),
+            message: "The request did not match what this endpoint expects".to_string(),
+            details: Some(details),
+        }
+    }
+
+    #[test]
+    fn a_validation_failure_names_every_field_it_rejected() {
+        let error = anyhow::Error::new(rejected_by_the_server());
+        let details = api_details(&error).expect("the server named the fields");
+        assert_eq!(
+            detail_lines(details),
+            vec![
+                "assetIds.3: Invalid UUID",
+                "limit: Too large",
+                "limit: Must be an integer",
+            ]
+        );
+    }
+
+    #[test]
+    fn json_carries_the_map_the_server_sent_unrenamed() {
+        let error = anyhow::Error::new(rejected_by_the_server());
+        let value = error_json(&error, api_details(&error));
+        assert_eq!(
+            value["error"],
+            "The request did not match what this endpoint expects (400 validation_failed)"
+        );
+        assert_eq!(value["details"]["assetIds.3"][0], "Invalid UUID");
+        assert_eq!(value["details"]["limit"][1], "Must be an integer");
+    }
+
+    /// A command that adds its own context leaves the SDK error further down the chain,
+    /// so the map has to be looked for there rather than only at the top.
+    #[test]
+    fn the_map_survives_a_commands_own_context() {
+        let error =
+            anyhow::Error::new(rejected_by_the_server()).context("could not empty the trash");
+        assert!(api_details(&error).is_some());
+    }
+
+    #[test]
+    fn a_failure_the_server_did_not_describe_gains_no_details_key() {
+        let error = anyhow::anyhow!("the request never got an answer");
+        let value = error_json(&error, api_details(&error));
+        assert!(value.get("details").is_none());
+        assert_eq!(value["causes"], serde_json::json!([]));
     }
 }
