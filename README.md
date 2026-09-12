@@ -153,7 +153,7 @@ imogen ls · search · show · stats · timeline    the library
 imogen upload · download · edit · trash · restore
 imogen album    list · show · create · update · delete · add · remove
 imogen share    create · show · revoke            public links
-imogen people   list · show · name · merge · hide · faces · status
+imogen people   list · show · name · merge · reassign · hide · faces · status
 imogen account  show · update · password · logout-everywhere
 imogen admin    users · invites · queue · clients · sessions · storage · settings · shares
 ```
