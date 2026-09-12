@@ -237,7 +237,9 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
 fn report_line(path: &Path, result: &imogen_sdk::Result<AssetUploadResult>) -> serde_json::Value {
     match result {
         Ok(outcome) => json!({
-            "path": path,
+            // Rendered the way `Failure` renders it: serializing a `Path` straight is
+            // fallible, and a name that is not UTF-8 would panic the task that succeeded.
+            "path": path.display().to_string(),
             "ok": true,
             "id": outcome.asset.id,
             "duplicate": outcome.duplicate,

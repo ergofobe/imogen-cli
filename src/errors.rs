@@ -69,13 +69,16 @@ impl Failure {
     pub fn message(&self) -> String {
         let subject = self.id.as_deref().unwrap_or(&self.path);
         let head = format!("{subject}: {}", self.error);
-        let Some(details) = &self.details else {
-            return head;
-        };
-        let named: Vec<String> = detail_lines(details)
-            .into_iter()
+        let named: Vec<String> = self
+            .details
+            .iter()
+            .flat_map(detail_lines)
             .map(|line| format!("  {line}"))
             .collect();
+        // A map that names nothing is a map that says nothing: no blank line under it.
+        if named.is_empty() {
+            return head;
+        }
         format!("{head}\n{}", named.join("\n"))
     }
 }
@@ -158,6 +161,16 @@ mod tests {
         let failure = Failure::new(Path::new("/photos/harbour.jpg"), &error);
         assert!(serde_json::json!(failure).get("details").is_none());
         assert_eq!(failure.message(), "/photos/harbour.jpg: nothing to send");
+    }
+
+    /// A server that sends an empty map has named no field, so the message gains no
+    /// blank line where the fields would have been.
+    #[test]
+    fn a_map_that_names_nothing_adds_nothing() {
+        let error = rejection(&[("capturedAt", &[])]);
+        let failure = Failure::new(Path::new("/photos/harbour.jpg"), &error);
+        assert!(!failure.message().ends_with('\n'), "{}", failure.message());
+        assert_eq!(failure.message().lines().count(), 1);
     }
 
     #[test]
