@@ -1,7 +1,7 @@
 //! People, as grouped by face recognition.
 
 use anyhow::Result;
-use imogen_sdk::{AssetFilter, PersonUpdate};
+use imogen_sdk::{AssetFilter, Person, PersonUpdate};
 use serde_json::json;
 
 use crate::cli::PeopleCommand;
@@ -15,6 +15,8 @@ pub async fn run(ctx: &Context, command: &PeopleCommand) -> Result<()> {
         PeopleCommand::Name { person, name } => rename(ctx, person, name).await,
         PeopleCommand::Hide { person, undo } => hide(ctx, person, !*undo).await,
         PeopleCommand::Merge { keep, merge } => merge_people(ctx, keep, merge).await,
+        // clap has already refused both destinations and neither, so no `--to` is `--unassign`.
+        PeopleCommand::Reassign { faces, to, .. } => reassign(ctx, faces, to.as_deref()).await,
         PeopleCommand::Faces { asset } => faces(ctx, asset).await,
         PeopleCommand::Status => status(ctx).await,
         PeopleCommand::Enable { off } => enable(ctx, !*off).await,
@@ -158,6 +160,45 @@ async fn merge_people(ctx: &Context, keep: &str, merge: &[String]) -> Result<()>
     Ok(())
 }
 
+async fn reassign(ctx: &Context, face_ids: &[String], to: Option<&str>) -> Result<()> {
+    let person = match to {
+        Some(reference) => Some(ctx.find_person(reference).await?),
+        None => None,
+    };
+    ctx.client
+        .people
+        .reassign(face_ids, person.as_ref().map(|person| person.id.as_str()))
+        .await?;
+    if ctx.out.is_json() {
+        return ctx.out.json(&reassigned(face_ids, person.as_ref()));
+    }
+    ctx.out.note(
+        ctx.out
+            .paint(&moved_message(face_ids.len(), person.as_ref()), GREEN),
+    );
+    Ok(())
+}
+
+/// The endpoint answers with nothing at all, so the JSON audience gets what was asked for,
+/// in the wire's own spelling.
+fn reassigned(face_ids: &[String], person: Option<&Person>) -> serde_json::Value {
+    json!({
+        "faceIds": face_ids,
+        "personId": person.map(|person| person.id.as_str()),
+    })
+}
+
+fn moved_message(count: usize, person: Option<&Person>) -> String {
+    let faces = output::plural(count, "face");
+    match person {
+        Some(person) => format!(
+            "Moved {faces} onto {}.",
+            person.name.as_deref().unwrap_or(&person.id)
+        ),
+        None => format!("Detached {faces}."),
+    }
+}
+
 async fn faces(ctx: &Context, asset: &str) -> Result<()> {
     let faces = ctx.client.people.faces_in(asset).await?;
     if ctx.out.is_json() {
@@ -222,4 +263,215 @@ async fn enable(ctx: &Context, enabled: bool) -> Result<()> {
         GREEN,
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use imogen_sdk::Person;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::cli::GlobalArgs;
+    use crate::config::Profile;
+
+    const PEOPLE: &str = r#"{"items":[
+        {"id":"person-1","name":"Alice","coverFaceId":null,"photoCount":3,"hidden":false},
+        {"id":"person-2","name":"Bob","coverFaceId":null,"photoCount":1,"hidden":false}
+    ]}"#;
+
+    fn person(id: &str, name: Option<&str>) -> Person {
+        Person {
+            id: id.into(),
+            name: name.map(str::to_string),
+            cover_face_id: None,
+            photo_count: 1,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn the_json_answer_names_the_faces_and_where_they_went() {
+        let faces = vec!["face-1".to_string(), "face-2".to_string()];
+        let moved = reassigned(&faces, Some(&person("person-1", Some("Alice"))));
+        assert_eq!(moved["faceIds"][1], "face-2");
+        assert_eq!(moved["personId"], "person-1");
+
+        let detached = reassigned(&faces, None);
+        assert!(
+            detached["personId"].is_null(),
+            "detaching is a person id of null, not a missing key"
+        );
+    }
+
+    #[test]
+    fn the_human_answer_says_who_the_faces_moved_to() {
+        assert_eq!(
+            moved_message(2, Some(&person("person-1", Some("Alice")))),
+            "Moved 2 faces onto Alice."
+        );
+        assert_eq!(
+            moved_message(1, Some(&person("person-1", None))),
+            "Moved 1 face onto person-1.",
+            "an unnamed grouping is still worth naming by its id"
+        );
+        assert_eq!(moved_message(1, None), "Detached 1 face.");
+    }
+
+    #[tokio::test]
+    async fn a_name_reaches_the_wire_as_a_person_id() {
+        let stub = stub().await;
+        reassign(&context(&stub.base_url), &["face-1".into()], Some("alice"))
+            .await
+            .unwrap();
+
+        let calls = stub.calls();
+        assert_eq!(calls.len(), 2, "the name is looked up, then the faces move");
+        assert_eq!(calls[1].0, "/api/v1/people/reassign");
+        let sent: serde_json::Value = serde_json::from_str(&calls[1].1).unwrap();
+        assert_eq!(sent["personId"], "person-1");
+        assert_eq!(sent["faceIds"], json!(["face-1"]));
+    }
+
+    #[tokio::test]
+    async fn an_id_is_taken_as_it_stands() {
+        let stub = stub().await;
+        reassign(
+            &context(&stub.base_url),
+            &["face-1".into(), "face-2".into()],
+            Some("person-2"),
+        )
+        .await
+        .unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&stub.calls()[1].1).unwrap();
+        assert_eq!(sent["personId"], "person-2");
+        assert_eq!(sent["faceIds"], json!(["face-1", "face-2"]));
+    }
+
+    #[tokio::test]
+    async fn unassigning_sends_a_null_person_and_looks_nobody_up() {
+        let stub = stub().await;
+        reassign(&context(&stub.base_url), &["face-1".into()], None)
+            .await
+            .unwrap();
+
+        let calls = stub.calls();
+        assert_eq!(calls.len(), 1, "there is nobody to resolve");
+        assert_eq!(calls[0].0, "/api/v1/people/reassign");
+        let sent: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert!(sent["personId"].is_null());
+    }
+
+    fn context(server: &str) -> Context {
+        let global = GlobalArgs {
+            server: None,
+            profile: None,
+            token: None,
+            json: false,
+            quiet: true,
+            no_color: true,
+        };
+        Context::from_profile(
+            &global,
+            "test",
+            Profile {
+                server: server.to_string(),
+                client_id: None,
+                access_token: Some("token".into()),
+                refresh_token: None,
+                expires_in: 3600,
+                obtained_at: 0,
+                scope: String::new(),
+            },
+            true,
+        )
+    }
+
+    struct Stub {
+        base_url: String,
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl Stub {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    /// A stub imogen, speaking just enough HTTP/1.1 to answer the two calls this command
+    /// makes and to record what it was asked. The SDK's own conformance suite does the
+    /// same rather than depending on a server framework nothing else here needs.
+    async fn stub() -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let recorded = calls.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let Some((path, body)) = read_request(&mut socket).await else {
+                        return;
+                    };
+                    let reply = if path == "/api/v1/people/reassign" {
+                        "{}"
+                    } else {
+                        PEOPLE
+                    };
+                    recorded.lock().unwrap().push((path, body));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+
+        Stub { base_url, calls }
+    }
+
+    /// The path asked for and the body sent with it.
+    async fn read_request(socket: &mut TcpStream) -> Option<(String, String)> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at;
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+        let path = head
+            .split_whitespace()
+            .nth(1)?
+            .split('?')
+            .next()?
+            .to_string();
+        let expected: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+
+        let mut body = buffer[head_end + 4..].to_vec();
+        while body.len() < expected {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        Some((path, String::from_utf8_lossy(&body).to_string()))
+    }
 }

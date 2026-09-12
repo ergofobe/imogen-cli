@@ -655,6 +655,25 @@ pub enum PeopleCommand {
         merge: Vec<String>,
     },
 
+    /// Move faces onto another person, when grouping put them on the wrong one
+    Reassign {
+        /// The face ids, from `imogen people faces <asset>`
+        #[arg(required = true)]
+        faces: Vec<String>,
+
+        /// Who to move them to, by id or name
+        #[arg(
+            long,
+            conflicts_with = "unassign",
+            required_unless_present = "unassign"
+        )]
+        to: Option<String>,
+
+        /// Take them off whoever they are on, leaving them on nobody
+        #[arg(long)]
+        unassign: bool,
+    },
+
     /// The faces found in one photograph
     Faces { asset: String },
 
@@ -850,6 +869,58 @@ mod tests {
             other => panic!("parsed as {other:?}"),
         }
         assert!(Cli::try_parse_from(["imogen", "ls", "--favorite"]).is_ok());
+    }
+
+    #[test]
+    fn moving_faces_needs_exactly_one_destination() {
+        // The face ids arrive last, from `imogen people faces <asset> --ids | xargs …`.
+        let moved = Cli::try_parse_from([
+            "imogen",
+            "people",
+            "reassign",
+            "--to",
+            "Correct Name",
+            "face-1",
+            "face-2",
+        ])
+        .unwrap();
+        match moved.command {
+            Some(Command::People(PeopleCommand::Reassign {
+                faces,
+                to,
+                unassign,
+            })) => {
+                assert_eq!(faces, vec!["face-1".to_string(), "face-2".to_string()]);
+                assert_eq!(to.as_deref(), Some("Correct Name"));
+                assert!(!unassign);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["imogen", "people", "reassign", "face-1", "--unassign"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "imogen",
+                "people",
+                "reassign",
+                "face-1",
+                "--to",
+                "Alice",
+                "--unassign"
+            ])
+            .is_err(),
+            "a face cannot both move to somebody and be detached"
+        );
+        assert!(
+            Cli::try_parse_from(["imogen", "people", "reassign", "face-1"]).is_err(),
+            "a destination is not optional: silently doing nothing would be worse"
+        );
+        assert!(
+            Cli::try_parse_from(["imogen", "people", "reassign", "--unassign"]).is_err(),
+            "no faces named"
+        );
     }
 
     #[test]
