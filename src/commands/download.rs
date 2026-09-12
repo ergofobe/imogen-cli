@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::cli::DownloadArgs;
 use crate::context::Context;
+use crate::errors::Failure;
 use crate::output::{self, GREEN};
 
 pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
@@ -87,11 +88,7 @@ pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
                 "bytes": bytes,
             })),
             Ok(None) => skipped += 1,
-            Err(error) => failures.push(json!({
-                "id": asset.id,
-                "path": path,
-                "error": error.to_string(),
-            })),
+            Err(error) => failures.push(Failure::new(&path, &error).with_id(asset.id)),
         }
     }
 
@@ -105,11 +102,7 @@ pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
         }));
     }
     for failure in &failures {
-        ctx.out.warn(format!(
-            "{}: {}",
-            failure["id"].as_str().unwrap_or_default(),
-            failure["error"].as_str().unwrap_or_default()
-        ));
+        ctx.out.warn(failure.message());
     }
     let bytes: u64 = written
         .iter()
