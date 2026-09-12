@@ -252,12 +252,19 @@ fn report_line(path: &Path, result: &imogen_sdk::Result<AssetUploadResult>) -> s
     }
 }
 
+/// One file as `--dry-run --json` lists it. The path is rendered rather than serialized
+/// for the reason `report_line` renders it: a name that is not UTF-8 would panic.
+fn plan_item(job: &Job) -> serde_json::Value {
+    json!({
+        "path": job.path.display().to_string(),
+        "metadata": job.metadata,
+        "album": job.album,
+    })
+}
+
 fn report_plan(ctx: &Context, jobs: &[Job], total_bytes: u64) -> Result<()> {
     if ctx.out.is_json() {
-        let items: Vec<_> = jobs
-            .iter()
-            .map(|job| json!({ "path": job.path, "metadata": job.metadata, "album": job.album }))
-            .collect();
+        let items: Vec<_> = jobs.iter().map(plan_item).collect();
         return ctx.out.json(&json!({
             "count": items.len(),
             "bytes": total_bytes,
@@ -455,6 +462,26 @@ pub fn progress_bar(ctx: &Context, files: u64) -> Option<ProgressBar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel allows a filename UTF-8 cannot describe, so the listing has to render it
+    /// rather than panic on it: ergofobe/imogen-cli#24.
+    #[cfg(unix)]
+    #[test]
+    fn a_planned_file_whose_name_is_not_utf8_is_still_listed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let job = Job {
+            path: PathBuf::from(OsStr::from_bytes(b"/photos/harbour\x80.jpg")),
+            metadata: AssetUploadMetadata::default(),
+            album: None,
+            size: 0,
+        };
+        let item = plan_item(&job);
+        let shown = item["path"].as_str().expect("the path is a string");
+        assert!(shown.starts_with("/photos/harbour"), "{shown}");
+        assert!(shown.ends_with(".jpg"), "{shown}");
+    }
 
     #[test]
     fn a_manifest_time_may_be_text_or_seconds() {

@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::cli::{EditArgs, ListArgs, RestoreArgs, SearchArgs, ShowArgs, TrashArgs};
 use crate::context::Context;
 use crate::dates;
+use crate::errors::Failure;
 use crate::output::{self, GREEN, RED, YELLOW};
 
 pub async fn list(ctx: &Context, args: &ListArgs) -> Result<()> {
@@ -507,7 +508,7 @@ pub async fn edit(ctx: &Context, args: &EditArgs) -> Result<()> {
     for id in &targets {
         match ctx.client.assets.update(id, &patch).await {
             Ok(asset) => updated.push(asset),
-            Err(error) => failures.push(json!({ "id": id, "error": error.to_string() })),
+            Err(error) => failures.push(Failure::for_id(id, &error)),
         }
     }
 
@@ -520,7 +521,7 @@ pub async fn edit(ctx: &Context, args: &EditArgs) -> Result<()> {
         }));
     }
     for failure in &failures {
-        ctx.out.warn(failure.to_string());
+        ctx.out.warn(failure.message());
     }
     ctx.out.note(ctx.out.paint(
         &format!("Edited {}.", output::plural(updated.len(), "photograph")),
@@ -685,6 +686,19 @@ mod tests {
     use super::*;
     use imogen_sdk::TimelineBucket;
     use std::collections::HashMap;
+
+    /// A rejected edit has to carry the fields the server named, and the person has to be
+    /// told about them rather than handed the record: ergofobe/imogen-cli#23.
+    #[test]
+    fn an_edit_rejection_carries_the_fields_and_is_not_shown_as_json() {
+        let error = crate::errors::rejection(&[("capturedAt", &["Invalid date"])]);
+        let failure = Failure::for_id("asset-7", &error);
+        assert_eq!(json!(&failure)["details"]["capturedAt"][0], "Invalid date");
+        let shown = failure.message();
+        assert!(shown.contains("asset-7: "), "{shown}");
+        assert!(shown.contains("capturedAt: Invalid date"), "{shown}");
+        assert!(!shown.contains('{'), "{shown}");
+    }
 
     fn days(dates: &[&str]) -> Vec<TimelineBucket> {
         dates

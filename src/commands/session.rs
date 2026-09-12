@@ -78,7 +78,7 @@ async fn finish(
             "profile": name,
             "server": profile.server,
             "user": user,
-            "credentials": config_path()?,
+            "credentials": config_path()?.display().to_string(),
         }));
     }
     out.note(out.paint(
