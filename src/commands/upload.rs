@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
 use futures::stream::{self, StreamExt};
-use imogen_sdk::{AssetSelection, AssetUploadMetadata, GeoPoint, UploadOptions};
+use imogen_sdk::{AssetSelection, AssetUploadMetadata, AssetUploadResult, GeoPoint, UploadOptions};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::json;
@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::cli::UploadArgs;
 use crate::context::Context;
+use crate::errors::Failure;
 use crate::output::{self, GREEN};
 
 /// Extensions imogen stores. A folder of photographs usually has a `Thumbs.db` and a
@@ -134,19 +135,7 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
                 let result = ctx.client.assets.upload(&job.path, &options).await;
 
                 if let Some(report) = &report {
-                    let line = match &result {
-                        Ok(outcome) => json!({
-                            "path": job.path,
-                            "ok": true,
-                            "id": outcome.asset.id,
-                            "duplicate": outcome.duplicate,
-                        }),
-                        Err(error) => json!({
-                            "path": job.path,
-                            "ok": false,
-                            "error": error.to_string(),
-                        }),
-                    };
+                    let line = report_line(&job.path, &result);
                     // Flushed per line so an interrupted run leaves a usable record.
                     let mut file = report.lock().await;
                     let _ = writeln!(file, "{line}");
@@ -187,10 +176,7 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
                 }
                 uploaded.push(outcome.asset);
             }
-            Err(error) => failures.push(json!({
-                "path": job.path.display().to_string(),
-                "error": error.to_string(),
-            })),
+            Err(error) => failures.push(Failure::new(&job.path, &error)),
         }
     }
 
@@ -221,11 +207,7 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
         }))?;
     } else {
         for failure in &failures {
-            ctx.out.warn(format!(
-                "{}: {}",
-                failure["path"].as_str().unwrap_or_default(),
-                failure["error"].as_str().unwrap_or_default()
-            ));
+            ctx.out.warn(failure.message());
         }
         let summary = format!(
             "Uploaded {}{}{}.",
@@ -248,6 +230,26 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
         bail!("{} failed", output::plural(failures.len(), "file"));
     }
     Ok(())
+}
+
+/// One line of the `--report` JSONL: what became of one file, in the API's own field
+/// names, so the record of a run is readable without knowing this program.
+fn report_line(path: &Path, result: &imogen_sdk::Result<AssetUploadResult>) -> serde_json::Value {
+    match result {
+        Ok(outcome) => json!({
+            // Rendered the way `Failure` renders it: serializing a `Path` straight is
+            // fallible, and a name that is not UTF-8 would panic the task that succeeded.
+            "path": path.display().to_string(),
+            "ok": true,
+            "id": outcome.asset.id,
+            "duplicate": outcome.duplicate,
+        }),
+        Err(error) => {
+            let mut line = json!(Failure::new(path, error));
+            line["ok"] = json!(false);
+            line
+        }
+    }
 }
 
 fn report_plan(ctx: &Context, jobs: &[Job], total_bytes: u64) -> Result<()> {
@@ -477,6 +479,20 @@ mod tests {
         assert_eq!(entry.album.as_deref(), Some("Cornwall"));
         assert_eq!(entry.location.unwrap().latitude, 50.1);
         assert_eq!(entry.favorite, Some(true));
+    }
+
+    /// The report is what a script reads back, so a rejected file has to name the field
+    /// there too rather than only in the terminal.
+    #[test]
+    fn a_rejected_file_names_the_field_in_the_report() {
+        let result = Err(crate::errors::rejection(&[(
+            "capturedAt",
+            &["Invalid date"],
+        )]));
+        let line = report_line(Path::new("/photos/harbour.jpg"), &result);
+        assert_eq!(line["ok"], false);
+        assert_eq!(line["path"], "/photos/harbour.jpg");
+        assert_eq!(line["details"]["capturedAt"][0], "Invalid date");
     }
 
     #[test]
