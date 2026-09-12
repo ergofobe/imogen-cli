@@ -13,6 +13,17 @@ use crate::context::Context;
 use crate::errors::Failure;
 use crate::output::{self, GREEN};
 
+/// One file as `--dry-run --json` lists it. The path is rendered rather than serialized
+/// the way `Failure` renders it: a name that is not UTF-8 would panic.
+fn planned_item(id: &str, path: &Path) -> serde_json::Value {
+    json!({ "id": id, "path": path.display().to_string() })
+}
+
+/// One file that was actually written.
+fn written_item(id: &str, path: &Path, bytes: u64) -> serde_json::Value {
+    json!({ "id": id, "path": path.display().to_string(), "bytes": bytes })
+}
+
 pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
     let assets = resolve(ctx, args).await?;
     if assets.is_empty() {
@@ -35,7 +46,7 @@ pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
         if ctx.out.is_json() {
             let items: Vec<_> = planned
                 .iter()
-                .map(|(asset, path)| json!({ "id": asset.id, "path": path }))
+                .map(|(asset, path)| planned_item(&asset.id, path))
                 .collect();
             return ctx
                 .out
@@ -82,11 +93,7 @@ pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
     let mut failures = Vec::new();
     for (asset, path, result) in outcomes {
         match result {
-            Ok(Some(bytes)) => written.push(json!({
-                "id": asset.id,
-                "path": path,
-                "bytes": bytes,
-            })),
+            Ok(Some(bytes)) => written.push(written_item(&asset.id, &path, bytes)),
             Ok(None) => skipped += 1,
             Err(error) => failures.push(Failure::new(&path, &error).with_id(asset.id)),
         }
@@ -217,6 +224,28 @@ pub fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel allows a filename UTF-8 cannot describe, so neither the plan nor the
+    /// record of what was written may panic on one: ergofobe/imogen-cli#24.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_whose_name_is_not_utf8_is_still_reported() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = PathBuf::from(OsStr::from_bytes(b"/out/harbour\x80.jpg"));
+        let planned = planned_item("asset-7", &path);
+        assert!(
+            planned["path"]
+                .as_str()
+                .expect("the path is a string")
+                .starts_with("/out/harbour"),
+            "{planned}"
+        );
+        let written = written_item("asset-7", &path, 12);
+        assert_eq!(written["path"], planned["path"]);
+        assert_eq!(written["bytes"], 12);
+    }
 
     #[test]
     fn a_filename_from_a_camera_cannot_escape_the_output_folder() {

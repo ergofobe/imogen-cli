@@ -34,27 +34,44 @@ pub fn detail_lines(details: &Details) -> Vec<String> {
         .collect()
 }
 
-/// One file's failure within a batch, in the API's own shape. The key is absent rather
-/// than empty when the server named no fields, because `details` is the API's own
-/// optional map and not something this program invented.
+/// One rejection within a batch, in the API's own shape. A key is absent rather than
+/// empty when there is nothing to put in it: `details` is the API's own optional map and
+/// not something this program invented, and an edit names ids without touching a file.
 #[derive(Debug, Clone, Serialize)]
 pub struct Failure {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Details>,
 }
 
 impl Failure {
-    pub fn new(path: &Path, error: &imogen_sdk::Error) -> Self {
+    /// The rejection alone: the server's sentence and the fields it named. Whichever of
+    /// the two the command was working from is added by the constructor.
+    fn of(error: &imogen_sdk::Error) -> Self {
         Self {
             id: None,
-            path: path.display().to_string(),
+            path: None,
             error: error.to_string(),
             details: error.details().cloned(),
         }
+    }
+
+    pub fn new(path: &Path, error: &imogen_sdk::Error) -> Self {
+        Self {
+            // Serializing a `Path` straight is fallible, and a name that is not UTF-8
+            // would panic rather than be reported.
+            path: Some(path.display().to_string()),
+            ..Self::of(error)
+        }
+    }
+
+    /// `assets edit` works from ids and never touches a file.
+    pub fn for_id(id: impl Into<String>, error: &imogen_sdk::Error) -> Self {
+        Self::of(error).with_id(id)
     }
 
     /// A download knows which asset it was fetching; an upload only has the file.
@@ -67,8 +84,10 @@ impl Failure {
     /// the server's sentence, and under it the fields it refused. Told only that three
     /// files failed, nobody can tell which field of which file was wrong.
     pub fn message(&self) -> String {
-        let subject = self.id.as_deref().unwrap_or(&self.path);
-        let head = format!("{subject}: {}", self.error);
+        let head = match self.id.as_deref().or(self.path.as_deref()) {
+            Some(subject) => format!("{subject}: {}", self.error),
+            None => self.error.clone(),
+        };
         let named: Vec<String> = self
             .details
             .iter()
@@ -180,5 +199,19 @@ mod tests {
         assert!(failure.message().starts_with("asset-7: "));
         assert!(failure.message().contains("variant: Unknown variant"));
         assert_eq!(serde_json::json!(failure)["path"], "/out/harbour.jpg");
+    }
+
+    /// An edit has no file to name, so the record carries the id alone and the person is
+    /// told the field the server refused: ergofobe/imogen-cli#23.
+    #[test]
+    fn an_edit_failure_is_named_by_its_id_alone() {
+        let error = rejection(&[("capturedAt", &["Invalid date"])]);
+        let failure = Failure::for_id("asset-7", &error);
+        let record = serde_json::json!(&failure);
+        assert!(record.get("path").is_none(), "{record}");
+        assert_eq!(record["details"]["capturedAt"][0], "Invalid date");
+        let message = failure.message();
+        assert!(message.starts_with("asset-7: "), "{message}");
+        assert!(message.contains("capturedAt: Invalid date"), "{message}");
     }
 }
