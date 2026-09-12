@@ -17,7 +17,7 @@ pub async fn run(ctx: &Context, command: &PeopleCommand) -> Result<()> {
         PeopleCommand::Merge { keep, merge } => merge_people(ctx, keep, merge).await,
         // clap has already refused both destinations and neither, so no `--to` is `--unassign`.
         PeopleCommand::Reassign { faces, to, .. } => reassign(ctx, faces, to.as_deref()).await,
-        PeopleCommand::Faces { asset } => faces(ctx, asset).await,
+        PeopleCommand::Faces { asset, ids } => faces(ctx, asset, *ids).await,
         PeopleCommand::Status => status(ctx).await,
         PeopleCommand::Enable { off } => enable(ctx, !*off).await,
     }
@@ -188,6 +188,8 @@ fn reassigned(face_ids: &[String], person: Option<&Person>) -> serde_json::Value
     })
 }
 
+/// The count is what was asked for, not what the server moved: the endpoint answers 204
+/// with no body, and ignores face ids it does not know rather than refusing them.
 fn moved_message(count: usize, person: Option<&Person>) -> String {
     let faces = output::plural(count, "face");
     match person {
@@ -199,10 +201,16 @@ fn moved_message(count: usize, person: Option<&Person>) -> String {
     }
 }
 
-async fn faces(ctx: &Context, asset: &str) -> Result<()> {
+async fn faces(ctx: &Context, asset: &str, ids_only: bool) -> Result<()> {
     let faces = ctx.client.people.faces_in(asset).await?;
     if ctx.out.is_json() {
         return ctx.out.json(&json!({ "items": faces }));
+    }
+    if ids_only {
+        for face in &faces {
+            ctx.out.value(&face.id);
+        }
+        return Ok(());
     }
     if faces.is_empty() {
         ctx.out.note("No faces found in that photograph.");
@@ -270,7 +278,6 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use imogen_sdk::Person;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -417,16 +424,18 @@ mod tests {
                     let Some((path, body)) = read_request(&mut socket).await else {
                         return;
                     };
-                    let reply = if path == "/api/v1/people/reassign" {
-                        "{}"
+                    // 204 and no body, exactly as the server answers a reassign: the SDK
+                    // has its own branch for that, and a stub that replied `{}` would
+                    // leave it untested.
+                    let response = if path == "/api/v1/people/reassign" {
+                        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
                     } else {
-                        PEOPLE
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PEOPLE}",
+                            PEOPLE.len()
+                        )
                     };
                     recorded.lock().unwrap().push((path, body));
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                        reply.len()
-                    );
                     let _ = socket.write_all(response.as_bytes()).await;
                     let _ = socket.flush().await;
                 });

@@ -675,7 +675,12 @@ pub enum PeopleCommand {
     },
 
     /// The faces found in one photograph
-    Faces { asset: String },
+    Faces {
+        asset: String,
+        /// Print only the face ids, one per line, for piping into `people reassign`
+        #[arg(long)]
+        ids: bool,
+    },
 
     /// Whether face grouping is on, and how far it has got
     Status,
@@ -899,6 +904,10 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(["imogen", "people", "reassign", "face-1", "--unassign"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["imogen", "people", "faces", "asset-1", "--ids"]).is_ok(),
+            "the ids the pipeline starts from have to be printable on their own"
         );
         assert!(
             Cli::try_parse_from([
