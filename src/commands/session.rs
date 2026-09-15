@@ -193,7 +193,10 @@ struct ProfilesView<'a> {
     profiles: BTreeMap<&'a str, ProfileView<'a>>,
 }
 
+/// camelCase like every other key this program synthesises — `capturedAt`, `faceIds`,
+/// `loggedOut` — rather than the snake_case these fields happen to wear on disk.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProfileView<'a> {
     server: &'a str,
     signed_in_via: &'static str,
@@ -318,16 +321,16 @@ mod tests {
             json["profiles"]["home"]["server"],
             "https://photos.example.com"
         );
-        assert_eq!(json["profiles"]["home"]["signed_in_via"], "browser");
+        assert_eq!(json["profiles"]["home"]["signedInVia"], "browser");
         assert_eq!(json["profiles"]["home"]["scope"], "library:read");
         assert_eq!(
-            json["profiles"]["home"]["expires_at"],
+            json["profiles"]["home"]["expiresAt"],
             1_700_000_000_000u64 + 3_600_000
         );
 
-        assert_eq!(json["profiles"]["family"]["signed_in_via"], "token");
+        assert_eq!(json["profiles"]["family"]["signedInVia"], "token");
         assert!(
-            json["profiles"]["family"]["expires_at"].is_null(),
+            json["profiles"]["family"]["expiresAt"].is_null(),
             "a pasted token has no expiry to report"
         );
     }
