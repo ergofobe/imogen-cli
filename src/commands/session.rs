@@ -238,9 +238,6 @@ fn profiles_view(config: &Config) -> ProfilesView<'_> {
 /// that is the right name for a profile about to be written and the wrong description of
 /// what exists.
 fn current_profile(config: &Config) -> Option<&str> {
-    if config.profiles.is_empty() {
-        return None;
-    }
     config
         .current
         .as_deref()
@@ -302,10 +299,27 @@ mod tests {
         for secret in ["at-SECRET-ACCESS", "rt-SECRET-REFRESH", "at-SECRET-PASTED"] {
             assert!(!json.contains(secret), "{secret} reached stdout: {json}");
         }
-        assert!(
-            !json.contains("token\":"),
-            "no credential field at all: {json}"
-        );
+        // Every key, not every byte: “token” is a legitimate *value* of `signedInVia`.
+        // Case-insensitive because `rename_all = "camelCase"` means the next credential
+        // would arrive as `accessToken` rather than the `access_token` it wears on disk.
+        let view = serde_json::to_value(profiles_view(&config)).unwrap();
+        for key in keys(&view) {
+            let key = key.to_lowercase();
+            for word in ["token", "secret", "password", "credential"] {
+                assert!(!key.contains(word), "“{key}” is a credential field: {json}");
+            }
+        }
+    }
+
+    fn keys(value: &serde_json::Value) -> Vec<String> {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .flat_map(|(key, nested)| std::iter::once(key.clone()).chain(keys(nested)))
+                .collect(),
+            serde_json::Value::Array(items) => items.iter().flat_map(keys).collect(),
+            _ => Vec::new(),
+        }
     }
 
     #[test]
