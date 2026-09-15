@@ -230,9 +230,11 @@ impl Context {
         }
     }
 
-    /// A person by id, or by enough of their name to be unambiguous — the same three
-    /// tiers as `find_album`, and for the same reason: somebody called "Al" should be
-    /// reachable by their whole name rather than lost to "Alice" starting with it.
+    /// A person by id, by their whole name when exactly one person carries it, or by
+    /// enough of it to be unambiguous. The whole-name tier is why somebody called "Al" is
+    /// reachable at all rather than lost to "Alice" starting with it. `find_album` has the
+    /// same three tiers but neither of the guards below: it takes the first exact name
+    /// without checking it is unique, and accepts an empty reference.
     pub async fn find_person(&self, reference: &str) -> Result<Person> {
         // `contains("")` is true of every name, so an unset `$PERSON` in a script would
         // otherwise resolve to whoever happened to be listed first — and `merge` and

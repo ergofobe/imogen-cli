@@ -983,8 +983,15 @@ mod tests {
             .is_err(),
             "a description cannot both be written and removed"
         );
+        // Both sides of each pair alone, so a `conflicts_with` naming the wrong id cannot
+        // stop a legitimate single flag parsing without a test noticing.
         assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--reset-captured-at"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["imogen", "edit", "asset-1", "--captured-at", "2020-01-01"])
+                .is_ok()
+        );
         assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "-d", "a caption"]).is_ok());
+        assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--clear-description"]).is_ok());
     }
 
     #[test]
