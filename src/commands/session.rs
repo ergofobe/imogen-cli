@@ -224,17 +224,23 @@ fn profiles_view(config: &Config) -> ProfilesView<'_> {
     }
 }
 
-/// The profile a command would reach for today — the one the table paints yellow.
-/// `Config::default_profile_name` invents “default” for an empty config, which is the
-/// right answer for naming a profile about to be written and the wrong one for describing
-/// what is saved.
+/// The profile a command would reach for, which is what both audiences are told.
+///
+/// The same answer as `Config::default_profile_name`, on purpose: a `current` naming a
+/// profile that is no longer saved is reported as it stands rather than quietly repaired,
+/// because that is the name every other command will try and fail on. Repairing it here
+/// would have `profiles` point at one login while `ls` reached for another.
+///
+/// The one departure is the empty config, where `default_profile_name` invents “default”:
+/// that is the right name for a profile about to be written and the wrong description of
+/// what exists.
 fn current_profile(config: &Config) -> Option<&str> {
-    let named = config.current.as_deref();
+    if config.profiles.is_empty() {
+        return None;
+    }
     config
-        .profiles
-        .keys()
-        .map(String::as_str)
-        .find(|name| Some(*name) == named)
+        .current
+        .as_deref()
         .or_else(|| config.profiles.keys().next().map(String::as_str))
 }
 
@@ -332,13 +338,28 @@ mod tests {
         assert!(json["current"].is_null());
     }
 
-    /// `current` naming a profile that was removed would send automation to a login that
-    /// is not there; the answer falls back the same way the commands themselves do.
+    /// A `current` naming a profile that is no longer saved — a hand-edited file, or one
+    /// written by an older version — is reported as it stands, because that is the name
+    /// every other command will try. Reporting a repaired one would say `profiles` and
+    /// `ls` agree when they do not.
     #[test]
-    fn a_stale_current_falls_back_to_a_profile_that_exists() {
+    fn a_stale_current_is_reported_as_the_commands_will_read_it() {
         let mut config = saved();
         config.current = Some("gone".into());
+
+        assert_eq!(config.default_profile_name(), "gone");
         let json = serde_json::to_value(profiles_view(&config)).unwrap();
-        assert_eq!(json["current"], "family", "the first profile by name");
+        assert_eq!(json["current"], "gone");
+    }
+
+    /// With no `current` recorded, both audiences fall to the first profile by name.
+    #[test]
+    fn with_nothing_chosen_the_first_profile_by_name_is_current() {
+        let mut config = saved();
+        config.current = None;
+
+        assert_eq!(config.default_profile_name(), "family");
+        let json = serde_json::to_value(profiles_view(&config)).unwrap();
+        assert_eq!(json["current"], "family");
     }
 }
