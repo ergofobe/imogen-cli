@@ -471,7 +471,7 @@ pub struct EditArgs {
     pub unarchive: bool,
 
     /// Set the description
-    #[arg(long, short = 'd')]
+    #[arg(long, short = 'd', conflicts_with = "clear_description")]
     pub description: Option<String>,
 
     /// Remove the description
@@ -479,7 +479,7 @@ pub struct EditArgs {
     pub clear_description: bool,
 
     /// Correct the capture time, as ISO-8601 or YYYY-MM-DD
-    #[arg(long)]
+    #[arg(long, conflicts_with = "reset_captured_at")]
     pub captured_at: Option<String>,
 
     /// Discard a capture-time correction and go back to the imported date
@@ -487,7 +487,7 @@ pub struct EditArgs {
     pub reset_captured_at: bool,
 
     /// Set where it was taken: lat,lon[,altitude]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "clear_location")]
     pub location: Option<String>,
 
     /// Forget where it was taken
@@ -930,6 +930,68 @@ mod tests {
             Cli::try_parse_from(["imogen", "people", "reassign", "--unassign"]).is_err(),
             "no faces named"
         );
+    }
+
+    #[test]
+    fn setting_and_clearing_a_location_are_not_both_accepted() {
+        // Taking both used to let the clear win silently, which loses the value the
+        // person actually asked to set.
+        assert!(
+            Cli::try_parse_from([
+                "imogen",
+                "edit",
+                "asset-1",
+                "--location",
+                "50.1,-5.5",
+                "--clear-location"
+            ])
+            .is_err(),
+            "a location cannot both be set and forgotten"
+        );
+        assert!(
+            Cli::try_parse_from(["imogen", "edit", "asset-1", "--location", "50.1,-5.5"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--clear-location"]).is_ok());
+    }
+
+    #[test]
+    fn setting_and_clearing_the_other_editable_fields_are_not_both_accepted() {
+        // The same contradiction as --location, in the two sibling pairs of the same
+        // command. --captured-at with --reset-captured-at reached the server as both, and
+        // the server drops the date; -d with --clear-description sent a null.
+        assert!(
+            Cli::try_parse_from([
+                "imogen",
+                "edit",
+                "asset-1",
+                "--captured-at",
+                "2020-01-01",
+                "--reset-captured-at"
+            ])
+            .is_err(),
+            "a capture time cannot both be corrected and reset"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "imogen",
+                "edit",
+                "asset-1",
+                "-d",
+                "a caption",
+                "--clear-description"
+            ])
+            .is_err(),
+            "a description cannot both be written and removed"
+        );
+        // Both sides of each pair alone, so a `conflicts_with` naming the wrong id cannot
+        // stop a legitimate single flag parsing without a test noticing.
+        assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--reset-captured-at"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["imogen", "edit", "asset-1", "--captured-at", "2020-01-01"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "-d", "a caption"]).is_ok());
+        assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--clear-description"]).is_ok());
     }
 
     #[test]

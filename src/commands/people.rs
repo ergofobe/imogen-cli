@@ -286,7 +286,21 @@ mod tests {
 
     const PEOPLE: &str = r#"{"items":[
         {"id":"person-1","name":"Alice","coverFaceId":null,"photoCount":3,"hidden":false},
-        {"id":"person-2","name":"Bob","coverFaceId":null,"photoCount":1,"hidden":false}
+        {"id":"person-2","name":"Bob","coverFaceId":null,"photoCount":1,"hidden":false},
+        {"id":"person-3","name":"Al","coverFaceId":null,"photoCount":2,"hidden":false}
+    ]}"#;
+
+    /// A library with nobody to be ambiguous with, which is where an empty reference does
+    /// its damage quietly rather than colliding with a second match.
+    const ONE_PERSON: &str = r#"{"items":[
+        {"id":"person-1","name":"Alice","coverFaceId":null,"photoCount":3,"hidden":false}
+    ]}"#;
+
+    /// Two clusters carrying the same whole name, which is the state `people merge` exists
+    /// to resolve and therefore one an exact-name match has to cope with.
+    const TWO_ALS: &str = r#"{"items":[
+        {"id":"person-1","name":"Al","coverFaceId":null,"photoCount":3,"hidden":false},
+        {"id":"person-2","name":"Al","coverFaceId":null,"photoCount":1,"hidden":false}
     ]}"#;
 
     fn person(id: &str, name: Option<&str>) -> Person {
@@ -372,6 +386,76 @@ mod tests {
         assert!(sent["personId"].is_null());
     }
 
+    #[tokio::test]
+    async fn an_empty_destination_is_refused_before_anything_moves() {
+        // `--to "$PERSON"` with the variable unset. `contains("")` is true of every name,
+        // so this used to resolve to the only person in the library and move faces onto
+        // them, exit 0.
+        for reference in ["", "   "] {
+            let stub = stub_returning(ONE_PERSON).await;
+            let error = reassign(
+                &context(&stub.base_url),
+                &["face-1".into()],
+                Some(reference),
+            )
+            .await
+            .expect_err("an empty --to is not a person");
+            assert!(
+                error.to_string().contains("Name somebody"),
+                "said {error} instead of naming the problem"
+            );
+            assert!(
+                stub.calls().is_empty(),
+                "nothing should reach the wire for a reference that cannot name anybody"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exact_name_beats_the_longer_one_it_is_a_prefix_of() {
+        // "Al" is somebody's whole name as well as the start of "Alice". Refusing it as
+        // ambiguous left that person unreachable by the name they actually have.
+        let stub = stub().await;
+        reassign(&context(&stub.base_url), &["face-1".into()], Some("Al"))
+            .await
+            .unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&stub.calls()[1].1).unwrap();
+        assert_eq!(sent["personId"], "person-3");
+    }
+
+    #[tokio::test]
+    async fn a_name_two_people_share_is_still_refused() {
+        // Person names are not unique. An exact match that took the first of them would be
+        // the same arbitrary resolution as the empty reference, just harder to notice.
+        let stub = stub_returning(TWO_ALS).await;
+        let error = reassign(&context(&stub.base_url), &["face-1".into()], Some("Al"))
+            .await
+            .expect_err("two people are called Al");
+        assert!(
+            error.to_string().contains("use an id instead"),
+            "said {error} instead of refusing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_with_a_stray_newline_still_finds_them() {
+        // The same shell interpolation the empty guard is about: `--to "$(cat name.txt)"`
+        // arrives as "Alice\n". Refusing an empty reference on its trimmed form and then
+        // searching on the untrimmed one would report nobody called "Alice\n".
+        let stub = stub().await;
+        reassign(
+            &context(&stub.base_url),
+            &["face-1".into()],
+            Some("Alice\n"),
+        )
+        .await
+        .unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&stub.calls()[1].1).unwrap();
+        assert_eq!(sent["personId"], "person-1");
+    }
+
     fn context(server: &str) -> Context {
         let global = GlobalArgs {
             server: None,
@@ -412,6 +496,11 @@ mod tests {
     /// makes and to record what it was asked. The SDK's own conformance suite does the
     /// same rather than depending on a server framework nothing else here needs.
     async fn stub() -> Stub {
+        stub_returning(PEOPLE).await
+    }
+
+    /// The same stub over a library of the caller's choosing.
+    async fn stub_returning(people: &'static str) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -431,8 +520,8 @@ mod tests {
                         "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
                     } else {
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PEOPLE}",
-                            PEOPLE.len()
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{people}",
+                            people.len()
                         )
                     };
                     recorded.lock().unwrap().push((path, body));
