@@ -544,6 +544,8 @@ fn build_patch(args: &EditArgs) -> Result<AssetUpdate> {
     if args.unarchive {
         patch.archived = Some(false);
     }
+    // Each setting flag below is declared to conflict with the clearing one that follows
+    // it, so clap has already refused the pair and neither can overwrite the other.
     if let Some(description) = &args.description {
         patch.description = Some(Some(description.clone()));
     }
@@ -559,7 +561,6 @@ fn build_patch(args: &EditArgs) -> Result<AssetUpdate> {
     if let Some(location) = &args.location {
         patch.location = Some(Some(parse_location(location)?));
     }
-    // clap has already refused both at once, so neither branch can overwrite the other.
     if args.clear_location {
         patch.location = Some(None);
     }

@@ -471,7 +471,7 @@ pub struct EditArgs {
     pub unarchive: bool,
 
     /// Set the description
-    #[arg(long, short = 'd')]
+    #[arg(long, short = 'd', conflicts_with = "clear_description")]
     pub description: Option<String>,
 
     /// Remove the description
@@ -479,7 +479,7 @@ pub struct EditArgs {
     pub clear_description: bool,
 
     /// Correct the capture time, as ISO-8601 or YYYY-MM-DD
-    #[arg(long)]
+    #[arg(long, conflicts_with = "reset_captured_at")]
     pub captured_at: Option<String>,
 
     /// Discard a capture-time correction and go back to the imported date
@@ -952,6 +952,39 @@ mod tests {
             Cli::try_parse_from(["imogen", "edit", "asset-1", "--location", "50.1,-5.5"]).is_ok()
         );
         assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--clear-location"]).is_ok());
+    }
+
+    #[test]
+    fn setting_and_clearing_the_other_editable_fields_are_not_both_accepted() {
+        // The same contradiction as --location, in the two sibling pairs of the same
+        // command. --captured-at with --reset-captured-at reached the server as both, and
+        // the server drops the date; -d with --clear-description sent a null.
+        assert!(
+            Cli::try_parse_from([
+                "imogen",
+                "edit",
+                "asset-1",
+                "--captured-at",
+                "2020-01-01",
+                "--reset-captured-at"
+            ])
+            .is_err(),
+            "a capture time cannot both be corrected and reset"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "imogen",
+                "edit",
+                "asset-1",
+                "-d",
+                "a caption",
+                "--clear-description"
+            ])
+            .is_err(),
+            "a description cannot both be written and removed"
+        );
+        assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--reset-captured-at"]).is_ok());
+        assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "-d", "a caption"]).is_ok());
     }
 
     #[test]

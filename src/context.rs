@@ -245,12 +245,17 @@ impl Context {
             return Ok(exact.clone());
         }
         let lowered = reference.to_lowercase();
-        if let Some(named) = people.iter().find(|person| {
+        // Only when it is somebody's whole name and nobody else's. Person names are not
+        // unique — `people merge` exists because grouping produces two clusters for one
+        // person — so two called "Al" fall through to the ambiguity refusal below rather
+        // than resolving to whichever the server listed first.
+        let mut whole_name = people.iter().filter(|person| {
             person
                 .name
                 .as_deref()
                 .is_some_and(|name| name.to_lowercase() == lowered)
-        }) {
+        });
+        if let (Some(named), None) = (whole_name.next(), whole_name.next()) {
             return Ok(named.clone());
         }
         let matches: Vec<&Person> = people

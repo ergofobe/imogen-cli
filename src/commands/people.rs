@@ -296,6 +296,13 @@ mod tests {
         {"id":"person-1","name":"Alice","coverFaceId":null,"photoCount":3,"hidden":false}
     ]}"#;
 
+    /// Two clusters carrying the same whole name, which is the state `people merge` exists
+    /// to resolve and therefore one an exact-name match has to cope with.
+    const TWO_ALS: &str = r#"{"items":[
+        {"id":"person-1","name":"Al","coverFaceId":null,"photoCount":3,"hidden":false},
+        {"id":"person-2","name":"Al","coverFaceId":null,"photoCount":1,"hidden":false}
+    ]}"#;
+
     fn person(id: &str, name: Option<&str>) -> Person {
         Person {
             id: id.into(),
@@ -415,6 +422,20 @@ mod tests {
 
         let sent: serde_json::Value = serde_json::from_str(&stub.calls()[1].1).unwrap();
         assert_eq!(sent["personId"], "person-3");
+    }
+
+    #[tokio::test]
+    async fn a_name_two_people_share_is_still_refused() {
+        // Person names are not unique. An exact match that took the first of them would be
+        // the same arbitrary resolution as the empty reference, just harder to notice.
+        let stub = stub_returning(TWO_ALS).await;
+        let error = reassign(&context(&stub.base_url), &["face-1".into()], Some("Al"))
+            .await
+            .expect_err("two people are called Al");
+        assert!(
+            error.to_string().contains("use an id instead"),
+            "said {error} instead of refusing"
+        );
     }
 
     fn context(server: &str) -> Context {
