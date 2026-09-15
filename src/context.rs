@@ -230,12 +230,29 @@ impl Context {
         }
     }
 
+    /// A person by id, or by enough of their name to be unambiguous — the same three
+    /// tiers as `find_album`, and for the same reason: somebody called "Al" should be
+    /// reachable by their whole name rather than lost to "Alice" starting with it.
     pub async fn find_person(&self, reference: &str) -> Result<Person> {
+        // `contains("")` is true of every name, so an unset `$PERSON` in a script would
+        // otherwise resolve to whoever happened to be listed first — and `merge` and
+        // `reassign` move data. Refused before the lookup, so nothing reaches the wire.
+        if reference.trim().is_empty() {
+            bail!("Name somebody by id or name — an empty reference cannot pick anybody");
+        }
         let people = self.client.people.list(true).await?;
         if let Some(exact) = people.iter().find(|person| person.id == reference) {
             return Ok(exact.clone());
         }
         let lowered = reference.to_lowercase();
+        if let Some(named) = people.iter().find(|person| {
+            person
+                .name
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase() == lowered)
+        }) {
+            return Ok(named.clone());
+        }
         let matches: Vec<&Person> = people
             .iter()
             .filter(|person| {

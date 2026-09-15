@@ -559,6 +559,7 @@ fn build_patch(args: &EditArgs) -> Result<AssetUpdate> {
     if let Some(location) = &args.location {
         patch.location = Some(Some(parse_location(location)?));
     }
+    // clap has already refused both at once, so neither branch can overwrite the other.
     if args.clear_location {
         patch.location = Some(None);
     }
