@@ -1,7 +1,10 @@
 //! Signing in and out, and the saved logins.
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Result};
 use imogen_sdk::OAuthClient;
+use serde::Serialize;
 use serde_json::json;
 
 use crate::auth;
@@ -150,33 +153,192 @@ pub fn profiles(global: &GlobalArgs, args: &ProfilesArgs) -> Result<()> {
     }
 
     if out.is_json() {
-        return out.json(&config);
+        return out.json(&profiles_view(&config));
     }
     if config.profiles.is_empty() {
         out.note("No saved logins. Run: imogen login --server https://photos.example.com");
         return Ok(());
     }
-    let current = config.default_profile_name();
+    let current = current_profile(&config);
     let rows: Vec<Vec<String>> = config
         .profiles
         .iter()
         .map(|(name, profile)| {
             vec![
-                if *name == current {
+                if Some(name.as_str()) == current {
                     out.paint(name, YELLOW)
                 } else {
                     name.clone()
                 },
                 profile.server.clone(),
-                if profile.client_id.is_some() {
-                    "browser".into()
-                } else {
-                    "token".into()
-                },
+                signed_in_via(profile).to_string(),
                 profile.scope.clone(),
             ]
         })
         .collect();
     out.table(&["PROFILE", "SERVER", "SIGNED IN VIA", "SCOPES"], &rows);
     Ok(())
+}
+
+/// What `--json` says about the saved logins: the four things the table already shows,
+/// and nothing else.
+///
+/// A view struct rather than `#[serde(skip_serializing)]` on `Profile`'s token fields,
+/// because this one names everything it prints. A skip attribute has to be remembered by
+/// whoever adds the next credential to the config; a struct that has to be extended on
+/// purpose cannot leak one by omission.
+#[derive(Serialize)]
+struct ProfilesView<'a> {
+    current: Option<&'a str>,
+    profiles: BTreeMap<&'a str, ProfileView<'a>>,
+}
+
+#[derive(Serialize)]
+struct ProfileView<'a> {
+    server: &'a str,
+    signed_in_via: &'static str,
+    scope: &'a str,
+    /// Unix milliseconds. Absent for a pasted token, which carries no expiry at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u128>,
+}
+
+fn profiles_view(config: &Config) -> ProfilesView<'_> {
+    ProfilesView {
+        current: current_profile(config),
+        profiles: config
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                (
+                    name.as_str(),
+                    ProfileView {
+                        server: &profile.server,
+                        signed_in_via: signed_in_via(profile),
+                        scope: &profile.scope,
+                        expires_at: expires_at(profile),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The profile a command would reach for today — the one the table paints yellow.
+/// `Config::default_profile_name` invents “default” for an empty config, which is the
+/// right answer for naming a profile about to be written and the wrong one for describing
+/// what is saved.
+fn current_profile(config: &Config) -> Option<&str> {
+    let named = config.current.as_deref();
+    config
+        .profiles
+        .keys()
+        .map(String::as_str)
+        .find(|name| Some(*name) == named)
+        .or_else(|| config.profiles.keys().next().map(String::as_str))
+}
+
+fn signed_in_via(profile: &Profile) -> &'static str {
+    if profile.client_id.is_some() {
+        "browser"
+    } else {
+        "token"
+    }
+}
+
+fn expires_at(profile: &Profile) -> Option<u128> {
+    if profile.expires_in <= 0 || profile.obtained_at == 0 {
+        return None;
+    }
+    Some(profile.obtained_at + profile.expires_in as u128 * 1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn browser_profile() -> Profile {
+        Profile {
+            server: "https://photos.example.com".into(),
+            client_id: Some("client-1".into()),
+            access_token: Some("at-SECRET-ACCESS".into()),
+            refresh_token: Some("rt-SECRET-REFRESH".into()),
+            expires_in: 3600,
+            obtained_at: 1_700_000_000_000,
+            scope: "library:read".into(),
+        }
+    }
+
+    fn saved() -> Config {
+        let mut config = Config::default();
+        config.set("home", browser_profile());
+        config.set(
+            "family",
+            Profile::from_token(
+                "https://family.example.com".into(),
+                "at-SECRET-PASTED".into(),
+            ),
+        );
+        config
+    }
+
+    /// A grep of the serialised bytes rather than a field-by-field check: a credential
+    /// added to `Profile` later would reintroduce the leak silently, and only looking at
+    /// the whole string catches it.
+    #[test]
+    fn the_json_answer_carries_no_credentials() {
+        let config = saved();
+        let json = serde_json::to_string(&profiles_view(&config)).unwrap();
+
+        for secret in ["at-SECRET-ACCESS", "rt-SECRET-REFRESH", "at-SECRET-PASTED"] {
+            assert!(!json.contains(secret), "{secret} reached stdout: {json}");
+        }
+        assert!(
+            !json.contains("token\":"),
+            "no credential field at all: {json}"
+        );
+    }
+
+    #[test]
+    fn the_json_answer_describes_what_the_table_shows() {
+        let config = saved();
+        let json: serde_json::Value = serde_json::to_value(profiles_view(&config)).unwrap();
+
+        assert_eq!(
+            json["current"], "home",
+            "the first profile saved is the default"
+        );
+        assert_eq!(
+            json["profiles"]["home"]["server"],
+            "https://photos.example.com"
+        );
+        assert_eq!(json["profiles"]["home"]["signed_in_via"], "browser");
+        assert_eq!(json["profiles"]["home"]["scope"], "library:read");
+        assert_eq!(
+            json["profiles"]["home"]["expires_at"],
+            1_700_000_000_000u64 + 3_600_000
+        );
+
+        assert_eq!(json["profiles"]["family"]["signed_in_via"], "token");
+        assert!(
+            json["profiles"]["family"]["expires_at"].is_null(),
+            "a pasted token has no expiry to report"
+        );
+    }
+
+    #[test]
+    fn nothing_is_current_until_something_is_saved() {
+        let json = serde_json::to_value(profiles_view(&Config::default())).unwrap();
+        assert!(json["current"].is_null());
+    }
+
+    /// `current` naming a profile that was removed would send automation to a login that
+    /// is not there; the answer falls back the same way the commands themselves do.
+    #[test]
+    fn a_stale_current_falls_back_to_a_profile_that_exists() {
+        let mut config = saved();
+        config.current = Some("gone".into());
+        let json = serde_json::to_value(profiles_view(&config)).unwrap();
+        assert_eq!(json["current"], "family", "the first profile by name");
+    }
 }
