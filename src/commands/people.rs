@@ -438,6 +438,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_name_with_a_stray_newline_still_finds_them() {
+        // The same shell interpolation the empty guard is about: `--to "$(cat name.txt)"`
+        // arrives as "Alice\n". Refusing an empty reference on its trimmed form and then
+        // searching on the untrimmed one would report nobody called "Alice\n".
+        let stub = stub().await;
+        reassign(
+            &context(&stub.base_url),
+            &["face-1".into()],
+            Some("Alice\n"),
+        )
+        .await
+        .unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&stub.calls()[1].1).unwrap();
+        assert_eq!(sent["personId"], "person-1");
+    }
+
     fn context(server: &str) -> Context {
         let global = GlobalArgs {
             server: None,

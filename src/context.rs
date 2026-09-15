@@ -237,7 +237,10 @@ impl Context {
         // `contains("")` is true of every name, so an unset `$PERSON` in a script would
         // otherwise resolve to whoever happened to be listed first — and `merge` and
         // `reassign` move data. Refused before the lookup, so nothing reaches the wire.
-        if reference.trim().is_empty() {
+        // Trimmed once, so the guard and the search agree: the shell interpolation this
+        // is about is also where a trailing newline comes from.
+        let reference = reference.trim();
+        if reference.is_empty() {
             bail!("Name somebody by id or name — an empty reference cannot pick anybody");
         }
         let people = self.client.people.list(true).await?;
