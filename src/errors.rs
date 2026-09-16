@@ -78,12 +78,14 @@ impl Failure {
         }
     }
 
-    /// `assets edit` works from ids and never touches a file.
+    /// A failure with no file in it at all: `assets edit` works from ids, and so does the
+    /// album an upload could not fill.
     pub fn for_id(id: impl Into<String>, error: &imogen_sdk::Error) -> Self {
         Self::of(error).with_id(id)
     }
 
-    /// A download knows which asset it was fetching; an upload only has the file.
+    /// The second name, for the one command that has both: a download knows the asset it
+    /// was fetching as well as the file it was writing.
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self

@@ -182,6 +182,7 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
 
     let files_refused = failures.len();
     let mut added = 0u64;
+    let mut fills_done = 0usize;
     for (album_id, asset_ids) in &by_album {
         // Album membership goes on in chunks: an imported album can hold thousands.
         for chunk in asset_ids.chunks(500) {
@@ -191,7 +192,10 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
                 .add_assets(album_id, &AssetSelection::ids(chunk))
                 .await
             {
-                Ok(result) => added += result.added,
+                Ok(result) => {
+                    added += result.added;
+                    fills_done += 1;
+                }
                 // Filing what was uploaded is part of the run, so a refused fill is one
                 // of the run's failures: it carries the fields the server named, it is in
                 // the one document `--json` writes, and it counts towards `$?`. Named by
@@ -240,13 +244,24 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
     // file: counting a refused fill among the files would close a run that sent one file
     // with "1 of 2 files failed". "Item" is what the README already calls a batch's
     // members, and it is only reached for by a run that had one of the other kind.
-    let noun = if failures.len() > files_refused {
-        "item"
+    //
+    // The noun and what the total counts move together, because the noun names what is
+    // being counted: once fills are on the failed side they are on the succeeded side
+    // too, the way `download` counts a file it skipped alongside one it wrote. Counting
+    // them under "file" would be the same miscount the other way round.
+    let (noun, fills_through) = if failures.len() > files_refused {
+        ("item", fills_done)
     } else {
-        "file"
+        ("file", 0)
     };
     // A file the server already had is not a file that failed, so it counts as got through.
-    crate::commands::finish_batch(ctx, summary, failures.len(), uploaded.len(), noun)
+    crate::commands::finish_batch(
+        ctx,
+        summary,
+        failures.len(),
+        uploaded.len() + fills_through,
+        noun,
+    )
 }
 
 /// One line of the `--report` JSONL: what became of one file, in the API's own field

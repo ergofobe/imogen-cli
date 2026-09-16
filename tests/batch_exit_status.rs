@@ -154,6 +154,18 @@ fn album_called(name: &str) -> String {
     )
 }
 
+/// Two albums, which is what a manifest naming one per file files into.
+fn two_albums() -> String {
+    r#"{"items":[
+        {"id":"album-1","ownerId":"owner-1","name":"Trip","description":null,
+         "coverAssetId":null,"assetCount":0,"createdAt":"2024-01-01T00:00:00.000Z",
+         "updatedAt":"2024-01-01T00:00:00.000Z","shareSlug":null},
+        {"id":"album-2","ownerId":"owner-1","name":"Harbour","description":null,
+         "coverAssetId":null,"assetCount":0,"createdAt":"2024-01-01T00:00:00.000Z",
+         "updatedAt":"2024-01-01T00:00:00.000Z","shareSlug":null}]}"#
+        .to_string()
+}
+
 /// The album refusing what was uploaded, with the fields it faulted.
 fn full_album() -> (u16, String) {
     (
@@ -371,6 +383,57 @@ fn an_album_that_could_not_be_filled_is_a_failure_like_any_other() {
     assert!(
         documents[0]["failures"][0].get("path").is_none(),
         "{}",
+        documents[0]
+    );
+}
+
+/// The total has to count every item of the kind the noun names, on both sides of it.
+/// A run filing into two albums where one fill is refused did four things, three of them
+/// successfully — counting only the files would call it three, and drop the fill that
+/// worked. `download` has summed its two kinds of success under one noun since #27.
+#[test]
+fn a_fill_that_worked_is_counted_beside_the_one_that_did_not() {
+    let home = tempfile::tempdir().expect("a directory");
+    let server = Server::start(|method, path| match (method, path) {
+        ("GET", "/api/v1/albums") => (200, two_albums()),
+        ("POST", "/api/v1/albums/album-1/assets") => {
+            (200, r#"{"added":1,"skipped":0,"assetCount":1}"#.to_string())
+        }
+        ("POST", "/api/v1/albums/album-2/assets") => full_album(),
+        _ => uploaded("asset-1"),
+    });
+
+    // One file for each album, which is what a manifest is for.
+    let first = photograph(home.path(), "one.jpg");
+    let second = photograph(home.path(), "two.jpg");
+    let manifest = home.path().join("manifest.jsonl");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{{\"path\":\"{first}\",\"album\":\"Trip\"}}\n{{\"path\":\"{second}\",\"album\":\"Harbour\"}}\n"
+        ),
+    )
+    .expect("a manifest");
+
+    let output = imogen(
+        &server.base,
+        home.path(),
+        &[
+            "--json",
+            "upload",
+            "--manifest",
+            &manifest.display().to_string(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(EXIT_PARTIAL));
+    let documents = documents(&output);
+    assert_eq!(documents.len(), 1, "{documents:?}");
+    assert_eq!(documents[0]["uploaded"], 2);
+    assert_eq!(documents[0]["addedToAlbums"], 1);
+    assert_eq!(documents[0]["failed"], 1);
+    assert_eq!(
+        documents[0]["error"], "1 of 4 items failed",
+        "two files and two fills were attempted: {}",
         documents[0]
     );
 }
