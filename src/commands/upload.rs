@@ -209,21 +209,25 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
         for failure in &failures {
             ctx.out.warn(failure.message());
         }
-        let summary = format!(
-            "Uploaded {}{}{}.",
-            output::plural(uploaded.len() - duplicates, "file"),
-            if duplicates > 0 {
-                format!(", {duplicates} already there")
-            } else {
-                String::new()
-            },
-            if added > 0 {
-                format!(", {added} filed into albums")
-            } else {
-                String::new()
-            }
-        );
-        ctx.out.note(ctx.out.paint(&summary, GREEN));
+        // A run that got nothing through does not close with a green line saying so: the
+        // sentence `main` is about to print is the whole of what happened.
+        if !uploaded.is_empty() {
+            let summary = format!(
+                "Uploaded {}{}{}.",
+                output::plural(uploaded.len() - duplicates, "file"),
+                if duplicates > 0 {
+                    format!(", {duplicates} already there")
+                } else {
+                    String::new()
+                },
+                if added > 0 {
+                    format!(", {added} filed into albums")
+                } else {
+                    String::new()
+                }
+            );
+            ctx.out.note(ctx.out.paint(&summary, GREEN));
+        }
     }
 
     // A file the server already had is not a file that failed, so it counts as got through.

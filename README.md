@@ -271,15 +271,17 @@ An agent driving this program should know five things:
 
 1. **`--json` on everything.** The payload is the API's own. Errors come back as
    `{"error": "...", "causes": [...]}` on stdout in JSON mode, and the exit status is
-   non-zero. Exactly one JSON document reaches stdout, whatever happened.
+   non-zero. A command that answered writes exactly one document to stdout, whether it
+   worked or not — never a summary with an error appended after it.
 2. **The exit status of a batch says how much got through.** `upload`, `download` and
    `edit` exit **0** when nothing was refused, **1** when nothing got through, and **3**
    when some items succeeded and some were refused. (2 is left to clap, which uses it for
-   a command line it could not parse.) Their one document is the summary of the run
-   either way — `failed` and `failures` are always there — and a run that was not wholly
-   successful adds `error` to it rather than a second document after it. So `$?` says
-   whether to look and the summary says at what; there is no `causes` key on a batch,
-   because the run itself did not fail, some of its items did.
+   a command line it could not parse.) A batch that ran writes one document either way —
+   `failed` and `failures` are always in it — and a run that was not wholly successful
+   adds `error` to that document rather than a second one after it. So `$?` says whether
+   to look and the summary says at what; there is no `causes` key on a batch, because the
+   run itself did not fail, some of its items did. A batch with nothing to do says so on
+   stderr and writes no document at all.
 3. **stdout is data, stderr is commentary.** `--quiet` removes the commentary entirely.
 4. **`--yes` is required** for anything destructive selected by filter, because there is no
    terminal to answer a prompt. Naming ids explicitly never prompts.

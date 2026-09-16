@@ -203,6 +203,13 @@ fn an_edit_the_server_refused_entirely_fails() {
         &["edit", "asset-1", "asset-2", "--favorite"],
     );
     assert_eq!(prose.status.code(), Some(EXIT_FAILED));
+    // Nothing was edited, so nothing closes the run by saying how much was.
+    let commentary = String::from_utf8_lossy(&prose.stderr);
+    assert!(!commentary.contains("Edited 0"), "{commentary}");
+    assert!(
+        commentary.contains("capturedAt: Invalid date"),
+        "{commentary}"
+    );
 
     let json = imogen(
         &server.base,
@@ -221,13 +228,16 @@ fn an_edit_the_server_refused_entirely_fails() {
 #[test]
 fn a_partly_refused_upload_writes_one_document() {
     let home = tempfile::tempdir().expect("a directory");
-    let attempt = Arc::new(AtomicUsize::new(0));
-    let server = Server::start(move |_method, _path| {
-        // One file through, one refused — whichever order the concurrent uploads arrive in.
-        match attempt.fetch_add(1, Ordering::SeqCst) {
-            0 => rejected(),
-            _ => uploaded("asset-1"),
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let server = Server::start(move |method, path| {
+        // One file through, one refused — whichever order the concurrent uploads arrive
+        // in. Counted by endpoint rather than by request, so a preflight the program
+        // learns to make one day does not quietly become the refused one.
+        let upload = method == "POST" && path == "/api/v1/assets";
+        if upload && uploads.fetch_add(1, Ordering::SeqCst) == 0 {
+            return rejected();
         }
+        uploaded("asset-1")
     });
 
     let first = photograph(home.path(), "one.jpg");

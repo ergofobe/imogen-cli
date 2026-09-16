@@ -523,10 +523,14 @@ pub async fn edit(ctx: &Context, args: &EditArgs) -> Result<()> {
         for failure in &failures {
             ctx.out.warn(failure.message());
         }
-        ctx.out.note(ctx.out.paint(
-            &format!("Edited {}.", output::plural(updated.len(), "photograph")),
-            GREEN,
-        ));
+        // A run that got nothing done does not close with a green line saying so: the
+        // sentence `main` is about to print is the whole of what happened.
+        if !updated.is_empty() {
+            ctx.out.note(ctx.out.paint(
+                &format!("Edited {}.", output::plural(updated.len(), "photograph")),
+                GREEN,
+            ));
+        }
     }
 
     crate::commands::finish_batch(ctx, report, failures.len(), updated.len(), "photograph")

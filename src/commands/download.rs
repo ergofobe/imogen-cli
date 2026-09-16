@@ -111,23 +111,27 @@ pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
         for failure in &failures {
             ctx.out.warn(failure.message());
         }
-        let bytes: u64 = written
-            .iter()
-            .filter_map(|item| item["bytes"].as_u64())
-            .sum();
-        ctx.out.note(ctx.out.paint(
-            &format!(
-                "Wrote {}, {}{}.",
-                output::plural(written.len(), "file"),
-                output::bytes(bytes),
-                if skipped > 0 {
-                    format!(", {skipped} already there")
-                } else {
-                    String::new()
-                }
-            ),
-            GREEN,
-        ));
+        // A run that got nothing through does not close with a green line saying so: the
+        // sentence `main` is about to print is the whole of what happened.
+        if written.len() + skipped > 0 {
+            let bytes: u64 = written
+                .iter()
+                .filter_map(|item| item["bytes"].as_u64())
+                .sum();
+            ctx.out.note(ctx.out.paint(
+                &format!(
+                    "Wrote {}, {}{}.",
+                    output::plural(written.len(), "file"),
+                    output::bytes(bytes),
+                    if skipped > 0 {
+                        format!(", {skipped} already there")
+                    } else {
+                        String::new()
+                    }
+                ),
+                GREEN,
+            ));
+        }
     }
 
     // A file that was already there was not fetched, but it is on disk, which is what the
