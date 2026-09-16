@@ -175,23 +175,26 @@ impl Context {
         Ok(timeline.buckets.iter().map(|bucket| bucket.count).sum())
     }
 
-    /// The albums a reference is resolved against, once the reference is one that could
-    /// pick anything at all.
-    async fn albums_to_search(&self, reference: &str) -> Result<Vec<Album>> {
+    /// The reference as it will be searched for, and the albums to search it against.
+    /// Trimming and the empty guard live together here, so a caller cannot do one without
+    /// the other — which is the whole of #38.
+    async fn albums_for<'a>(&self, reference: &'a str) -> Result<(&'a str, Vec<Album>)> {
         // `contains("")` is true of every name, so `imogen trash --album "$ALBUM"` with
         // the variable unset would otherwise resolve to whichever album was listed first
         // and trash all of it. Refused before the lookup, so nothing reaches the wire.
+        // Trimmed first, so the shell interpolation this is about cannot smuggle an empty
+        // reference past the guard as "   ".
+        let reference = reference.trim();
         if reference.is_empty() {
             bail!("Name an album by id or name — an empty reference cannot pick one");
         }
-        Ok(self.client.albums.list().await?)
+        Ok((reference, self.client.albums.list().await?))
     }
 
     /// An album by id, or by enough of its name to be unambiguous. Naming one is what a
     /// person will actually do; refusing an ambiguous name is better than picking one.
     pub async fn find_album(&self, reference: &str) -> Result<Album> {
-        let reference = reference.trim();
-        let albums = self.albums_to_search(reference).await?;
+        let (reference, albums) = self.albums_for(reference).await?;
         if let Some(album) = named_album(&albums, reference)? {
             return Ok(album);
         }
@@ -205,13 +208,13 @@ impl Context {
             0 => Err(anyhow!(
                 "No album called \"{reference}\". `imogen album list` shows them, and `imogen album create` makes one."
             )),
-            _ => {
-                let names: Vec<&str> = matches.iter().map(|a| a.name.as_str()).collect();
-                Err(anyhow!(
-                    "\"{reference}\" matches several albums: {}",
-                    names.join(", ")
-                ))
-            }
+            // Named with their ids, like the refusal in `named_album` and for the same
+            // reason: two of the matches can carry the same name, and an id is the way
+            // past either refusal.
+            _ => Err(anyhow!(
+                "\"{reference}\" matches several albums; use an id instead: {}",
+                describe(&matches)
+            )),
         }
     }
 
@@ -228,8 +231,7 @@ impl Context {
         reference: &str,
         description: Option<&str>,
     ) -> Result<Album> {
-        let reference = reference.trim();
-        let albums = self.albums_to_search(reference).await?;
+        let (reference, albums) = self.albums_for(reference).await?;
         // Only a name nothing carries is made. This used to treat every failure as "not
         // there yet", so an ambiguous name quietly added another album of that name — and
         // a library that could not be listed at all did the same.
@@ -335,16 +337,21 @@ fn named_album(albums: &[Album], reference: &str) -> Result<Option<Album>> {
     match carrying.len() {
         1 => Ok(Some(carrying[0].clone())),
         0 => Ok(None),
-        // Listing the names would print the same one twice; the ids are what tells them
-        // apart and what the person needs to pass instead.
-        _ => {
-            let ids: Vec<&str> = carrying.iter().map(|a| a.id.as_str()).collect();
-            Err(anyhow!(
-                "Several albums are called \"{reference}\"; use an id instead: {}",
-                ids.join(", ")
-            ))
-        }
+        _ => Err(anyhow!(
+            "Several albums are called \"{reference}\"; use an id instead: {}",
+            describe(&carrying)
+        )),
     }
+}
+
+/// Albums for a refusal to name. Each carries its id, because the names are what was
+/// ambiguous: printing "Holiday, Holiday" tells nobody which album to mean.
+fn describe(albums: &[&Album]) -> String {
+    albums
+        .iter()
+        .map(|album| format!("{} ({})", album.name, album.id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl QueryArgs {
@@ -505,6 +512,26 @@ mod tests {
         assert!(
             stub.created().is_empty(),
             "an ambiguous name should not add a third album of that name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_name_matching_several_albums_names_them_by_id_too() {
+        // The sibling refusal, and the same problem: the matches can carry one name, so
+        // listing names alone would say "Holiday, Holiday".
+        let stub = stub_returning(TWO_HOLIDAYS).await;
+        let error = context(&stub.base_url)
+            .find_album("holi")
+            .await
+            .expect_err("two albums contain holi");
+        let said = error.to_string();
+        assert!(
+            said.contains("use an id instead"),
+            "said {said} instead of refusing"
+        );
+        assert!(
+            said.contains("album-1") && said.contains("album-2"),
+            "{said} has to say which album is which"
         );
     }
 
