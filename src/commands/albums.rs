@@ -5,7 +5,7 @@ use imogen_sdk::{AlbumCreate, AlbumUpdate, AssetFilter, AssetSelection};
 use serde_json::json;
 
 use crate::cli::{AlbumCommand, QueryArgs};
-use crate::context::Context;
+use crate::context::{album_name, Context};
 use crate::output::GREEN;
 
 pub async fn run(ctx: &Context, command: &AlbumCommand) -> Result<()> {
@@ -131,6 +131,7 @@ async fn create(
     description: Option<&str>,
     assets: &[String],
 ) -> Result<()> {
+    let name = album_name(name)?;
     let album = ctx
         .client
         .albums
@@ -157,6 +158,9 @@ async fn update(
     clear_description: bool,
     cover: Option<&str>,
 ) -> Result<()> {
+    // Before the album is even looked up: a rename that could never be undone by name is
+    // refused whatever else the command was asked to change.
+    let name = name.map(album_name).transpose()?;
     let album = ctx.find_album(reference).await?;
     let patch = AlbumUpdate {
         name: name.map(str::to_string),
@@ -293,4 +297,214 @@ async fn remove(ctx: &Context, reference: &str, assets: &[String]) -> Result<()>
             .paint(&format!("Took {removed} out of “{}”.", album.name), GREEN),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::cli::GlobalArgs;
+    use crate::config::Profile;
+
+    const ONE_ALBUM: &str = r#"{"items":[
+        {"id":"album-1","ownerId":"me","name":"Holiday","description":null,
+         "coverAssetId":null,"assetCount":9,"createdAt":"2024-01-01T00:00:00Z",
+         "updatedAt":"2024-01-01T00:00:00Z","shareSlug":null}
+    ]}"#;
+
+    #[tokio::test]
+    async fn an_album_cannot_be_created_without_a_name() {
+        // `imogen album create "$NAME"` with the variable unset. The name was sent as it
+        // stood, and the album that came back could never be named again: `find_album`
+        // refuses an empty reference, and no non-empty one matches an empty name.
+        for name in ["", "   "] {
+            let stub = stub().await;
+            let error = create(&context(&stub.base_url), name, None, &[])
+                .await
+                .expect_err("an empty name is not a name");
+            assert!(
+                error.to_string().contains("An album needs a name"),
+                "said {error} instead of naming the problem"
+            );
+            assert!(
+                stub.calls().is_empty(),
+                "nothing should reach the wire for a name that could never be used again"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_album_cannot_be_renamed_to_nothing() {
+        // The same write through the other door: an album that had a usable name loses it.
+        for name in ["", "   "] {
+            let stub = stub().await;
+            let error = update(
+                &context(&stub.base_url),
+                "album-1",
+                Some(name),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect_err("an empty name is not a name");
+            assert!(
+                error.to_string().contains("An album needs a name"),
+                "said {error} instead of naming the problem"
+            );
+            assert!(
+                stub.calls().is_empty(),
+                "the refusal comes before the album is even looked up"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_album_is_created_under_the_trimmed_name() {
+        // `album create` has to agree with `upload --album`, which already creates under
+        // the trimmed name: otherwise the same string makes two albums that a listing
+        // cannot tell apart. `named_album` compares the stored name trimmed, so a padded
+        // one answers to something it is not spelled as.
+        let stub = stub().await;
+        create(&context(&stub.base_url), " Trip\n", None, &[])
+            .await
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&stub.sent("post")[0]).unwrap();
+        assert_eq!(sent["name"], "Trip");
+    }
+
+    #[tokio::test]
+    async fn a_rename_is_stored_trimmed_too() {
+        let stub = stub().await;
+        update(
+            &context(&stub.base_url),
+            "album-1",
+            Some(" Trip\n"),
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&stub.sent("patch")[0]).unwrap();
+        assert_eq!(sent["name"], "Trip");
+    }
+
+    fn context(server: &str) -> Context {
+        let global = GlobalArgs {
+            server: None,
+            profile: None,
+            token: None,
+            json: false,
+            quiet: true,
+            no_color: true,
+        };
+        Context::from_profile(
+            &global,
+            "test",
+            Profile {
+                server: server.to_string(),
+                client_id: None,
+                access_token: Some("token".into()),
+                refresh_token: None,
+                expires_in: 3600,
+                obtained_at: 0,
+                scope: String::new(),
+            },
+            true,
+        )
+    }
+
+    struct Stub {
+        base_url: String,
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl Stub {
+        /// Every request, as method and body.
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// The bodies written by that method, which is what the album was named.
+        fn sent(&self, method: &str) -> Vec<String> {
+            self.calls()
+                .into_iter()
+                .filter(|(sent, _)| sent == method)
+                .map(|(_, body)| body)
+                .collect()
+        }
+    }
+
+    /// A stub imogen over a library of one album, speaking just enough HTTP/1.1 to list
+    /// albums, make one and change one, and recording what it was asked.
+    async fn stub() -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let recorded = calls.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let Some((method, body)) = read_request(&mut socket).await else {
+                        return;
+                    };
+                    let one = r#"{"id":"album-1","ownerId":"me","name":"Trip","description":null,"coverAssetId":null,"assetCount":0,"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z","shareSlug":null}"#;
+                    let payload = if method == "get" { ONE_ALBUM } else { one };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    recorded.lock().unwrap().push((method, body));
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+
+        Stub { base_url, calls }
+    }
+
+    /// The method asked for, and the body sent with it.
+    async fn read_request(socket: &mut TcpStream) -> Option<(String, String)> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at;
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+        let method = head.split_whitespace().next()?.to_string();
+        let expected: usize = head
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    (name.trim() == "content-length").then(|| value.trim().parse().ok())?
+                })
+            })
+            .unwrap_or(0);
+
+        let mut body = buffer[head_end + 4..].to_vec();
+        while body.len() < expected {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        Some((method, String::from_utf8_lossy(&body).to_string()))
+    }
 }
