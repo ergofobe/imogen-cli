@@ -175,40 +175,36 @@ impl Context {
         Ok(timeline.buckets.iter().map(|bucket| bucket.count).sum())
     }
 
-    /// An album by id, by its whole name when exactly one album carries it, or by enough
-    /// of its name to be unambiguous. `Ok(None)` is the one case a caller may answer by
-    /// making an album: an empty reference and an ambiguous one are errors, because
-    /// neither says which album was meant and creating one is not the answer to either.
-    ///
-    /// The reference arrives trimmed, so the guard and the search agree on what it is.
-    async fn look_up_album(&self, reference: &str) -> Result<Option<Album>> {
+    /// The albums a reference is resolved against, once the reference is one that could
+    /// pick anything at all.
+    async fn albums_to_search(&self, reference: &str) -> Result<Vec<Album>> {
         // `contains("")` is true of every name, so `imogen trash --album "$ALBUM"` with
         // the variable unset would otherwise resolve to whichever album was listed first
         // and trash all of it. Refused before the lookup, so nothing reaches the wire.
         if reference.is_empty() {
             bail!("Name an album by id or name — an empty reference cannot pick one");
         }
-        let albums = self.client.albums.list().await?;
-        if let Some(exact) = albums.iter().find(|album| album.id == reference) {
-            return Ok(Some(exact.clone()));
+        Ok(self.client.albums.list().await?)
+    }
+
+    /// An album by id, or by enough of its name to be unambiguous. Naming one is what a
+    /// person will actually do; refusing an ambiguous name is better than picking one.
+    pub async fn find_album(&self, reference: &str) -> Result<Album> {
+        let reference = reference.trim();
+        let albums = self.albums_to_search(reference).await?;
+        if let Some(album) = named_album(&albums, reference)? {
+            return Ok(album);
         }
         let lowered = reference.to_lowercase();
-        // Only when it is an album's whole name and no other album's. Album names have no
-        // unique index, so two called "Holiday" fall through to the ambiguity refusal
-        // below rather than resolving to whichever the server listed first.
-        let mut whole_name = albums
-            .iter()
-            .filter(|album| album.name.to_lowercase() == lowered);
-        if let (Some(named), None) = (whole_name.next(), whole_name.next()) {
-            return Ok(Some(named.clone()));
-        }
         let matches: Vec<&Album> = albums
             .iter()
             .filter(|album| album.name.to_lowercase().contains(&lowered))
             .collect();
         match matches.len() {
-            1 => Ok(Some(matches[0].clone())),
-            0 => Ok(None),
+            1 => Ok(matches[0].clone()),
+            0 => Err(anyhow!(
+                "No album called \"{reference}\". `imogen album list` shows them, and `imogen album create` makes one."
+            )),
             _ => {
                 let names: Vec<&str> = matches.iter().map(|a| a.name.as_str()).collect();
                 Err(anyhow!(
@@ -219,29 +215,25 @@ impl Context {
         }
     }
 
-    /// An album by id, or by enough of its name to be unambiguous. Naming one is what a
-    /// person will actually do; refusing an ambiguous name is better than picking one.
-    pub async fn find_album(&self, reference: &str) -> Result<Album> {
-        let reference = reference.trim();
-        self.look_up_album(reference).await?.ok_or_else(|| {
-            anyhow!(
-                "No album called \"{reference}\". `imogen album list` shows them, and `imogen album create` makes one."
-            )
-        })
-    }
-
     /// The album of that name, made if it is not there yet. A description is only used
     /// when the album is new: it never overwrites one somebody has already written.
     ///
-    /// Only a name nothing answers to is made: this used to treat every failure as "not
-    /// there yet", so an ambiguous name quietly added a third album of that name.
+    /// Only the exact name counts here, where `find_album` would go on to search partial
+    /// ones: filing into an album is a name, not a search. Settling for "Holiday 2024"
+    /// when asked for "Holiday" puts photographs somewhere nobody named, and refusing
+    /// "Holiday" as ambiguous between "Holiday 2024" and "Holiday 2025" would leave a new
+    /// album of that name impossible to make.
     pub async fn album_or_create(
         &self,
         reference: &str,
         description: Option<&str>,
     ) -> Result<Album> {
         let reference = reference.trim();
-        if let Some(album) = self.look_up_album(reference).await? {
+        let albums = self.albums_to_search(reference).await?;
+        // Only a name nothing carries is made. This used to treat every failure as "not
+        // there yet", so an ambiguous name quietly added another album of that name — and
+        // a library that could not be listed at all did the same.
+        if let Some(album) = named_album(&albums, reference)? {
             return Ok(album);
         }
         self.client
@@ -323,6 +315,38 @@ impl Context {
     }
 }
 
+/// The album a reference names outright: its id, or a name exactly one album carries.
+/// `Ok(None)` is nothing answering to it exactly — which `album_or_create` answers by
+/// making one and `find_album` by widening the search to partial names.
+///
+/// The whole-name tier has to check that the name is unique, because album names have no
+/// unique index: two called "Holiday" are refused rather than resolving to whichever the
+/// server listed first. The same shortcut was attempted for people while closing #30 and
+/// reintroduced the bug it was closing.
+fn named_album(albums: &[Album], reference: &str) -> Result<Option<Album>> {
+    if let Some(exact) = albums.iter().find(|album| album.id == reference) {
+        return Ok(Some(exact.clone()));
+    }
+    let lowered = reference.to_lowercase();
+    let carrying: Vec<&Album> = albums
+        .iter()
+        .filter(|album| album.name.to_lowercase() == lowered)
+        .collect();
+    match carrying.len() {
+        1 => Ok(Some(carrying[0].clone())),
+        0 => Ok(None),
+        // Listing the names would print the same one twice; the ids are what tells them
+        // apart and what the person needs to pass instead.
+        _ => {
+            let ids: Vec<&str> = carrying.iter().map(|a| a.id.as_str()).collect();
+            Err(anyhow!(
+                "Several albums are called \"{reference}\"; use an id instead: {}",
+                ids.join(", ")
+            ))
+        }
+    }
+}
+
 impl QueryArgs {
     pub fn is_empty(&self) -> bool {
         self.query.is_none()
@@ -390,6 +414,17 @@ mod tests {
          "updatedAt":"2024-01-01T00:00:00Z","shareSlug":null}
     ]}"#;
 
+    /// Two albums a partial name matches and neither carries, which is a name that can
+    /// still be made.
+    const TWO_YEARS: &str = r#"{"items":[
+        {"id":"album-1","ownerId":"me","name":"Holiday 2024","description":null,
+         "coverAssetId":null,"assetCount":9,"createdAt":"2024-01-01T00:00:00Z",
+         "updatedAt":"2024-01-01T00:00:00Z","shareSlug":null},
+        {"id":"album-2","ownerId":"me","name":"Holiday 2025","description":null,
+         "coverAssetId":null,"assetCount":4,"createdAt":"2024-01-01T00:00:00Z",
+         "updatedAt":"2024-01-01T00:00:00Z","shareSlug":null}
+    ]}"#;
+
     #[tokio::test]
     async fn an_empty_album_is_refused_before_anything_reaches_the_wire() {
         // `imogen trash --album "$ALBUM"` with the variable unset. `contains("")` is true
@@ -436,14 +471,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_name_two_albums_share_is_refused() {
+        // Album names are not unique. An exact match that took the first of them would be
+        // the same arbitrary resolution as the empty reference, just harder to notice.
         let stub = stub_returning(TWO_HOLIDAYS).await;
         let error = context(&stub.base_url)
             .find_album("Holiday")
             .await
             .expect_err("two albums are called Holiday");
+        let said = error.to_string();
         assert!(
-            error.to_string().contains("matches several albums"),
-            "said {error} instead of refusing"
+            said.contains("use an id instead"),
+            "said {said} instead of refusing"
+        );
+        assert!(
+            said.contains("album-1") && said.contains("album-2"),
+            "listing the same name twice says nothing; {said} has to name the ids"
         );
     }
 
@@ -457,12 +499,55 @@ mod tests {
             .await
             .expect_err("two albums are called Holiday");
         assert!(
-            error.to_string().contains("matches several albums"),
+            error.to_string().contains("use an id instead"),
             "said {error} instead of refusing"
         );
         assert!(
             stub.created().is_empty(),
             "an ambiguous name should not add a third album of that name"
+        );
+    }
+
+    #[tokio::test]
+    async fn filing_into_an_album_goes_by_the_whole_name_or_makes_it() {
+        // A name is a name here, not a search: uploading into "Holiday" while the library
+        // holds "Holiday 2024" and "Holiday 2025" makes the album asked for. Neither
+        // settling for one of them nor refusing the name as ambiguous would leave any way
+        // to have an album called "Holiday".
+        let stub = stub_returning(TWO_YEARS).await;
+        context(&stub.base_url)
+            .album_or_create("Holiday", None)
+            .await
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&stub.created()[0]).unwrap();
+        assert_eq!(sent["name"], "Holiday");
+    }
+
+    #[tokio::test]
+    async fn filing_into_an_album_does_not_settle_for_a_longer_name() {
+        // The single-match half of the same rule: "Holi" is nobody's album name, so it is
+        // made rather than quietly filing the photographs into "Holiday".
+        let stub = stub_returning(ONE_ALBUM).await;
+        context(&stub.base_url)
+            .album_or_create("Holi", None)
+            .await
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&stub.created()[0]).unwrap();
+        assert_eq!(sent["name"], "Holi");
+    }
+
+    #[tokio::test]
+    async fn a_library_that_cannot_be_listed_makes_nothing() {
+        // The failure `Err(_)` used to swallow: a server that cannot say what albums it
+        // has is not a server saying there is no such album.
+        let stub = stub_refusing_to_list().await;
+        context(&stub.base_url)
+            .album_or_create("Holiday", None)
+            .await
+            .expect_err("the albums could not be listed");
+        assert!(
+            stub.created().is_empty(),
+            "a listing that failed should not become a new album"
         );
     }
 
@@ -550,6 +635,16 @@ mod tests {
     /// A stub imogen over a library of the caller's choosing, speaking just enough
     /// HTTP/1.1 to list albums and to make one, and recording what it was asked.
     async fn stub_returning(albums: &'static str) -> Stub {
+        stub_listing(Some(albums)).await
+    }
+
+    /// The same stub, answering the album listing with a rejection. 400 rather than 500,
+    /// which the SDK retries: the point is a listing that failed, not the waiting.
+    async fn stub_refusing_to_list() -> Stub {
+        stub_listing(None).await
+    }
+
+    async fn stub_listing(albums: Option<&'static str>) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let calls: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -563,9 +658,13 @@ mod tests {
                         return;
                     };
                     let created = r#"{"id":"album-new","ownerId":"me","name":"Trip","description":null,"coverAssetId":null,"assetCount":0,"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z","shareSlug":null}"#;
-                    let payload = if method == "post" { created } else { albums };
+                    let (status, payload) = match (method.as_str(), albums) {
+                        ("post", _) => ("200 OK", created),
+                        (_, Some(albums)) => ("200 OK", albums),
+                        (_, None) => ("400 Bad Request", r#"{"error":"nope"}"#),
+                    };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                         payload.len()
                     );
                     recorded.lock().unwrap().push((method, path, body));
