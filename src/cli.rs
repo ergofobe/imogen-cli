@@ -552,7 +552,7 @@ pub enum AlbumCommand {
         album: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, short = 'd')]
+        #[arg(long, short = 'd', conflicts_with = "clear_description")]
         description: Option<String>,
         #[arg(long)]
         clear_description: bool,
@@ -992,6 +992,39 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "-d", "a caption"]).is_ok());
         assert!(Cli::try_parse_from(["imogen", "edit", "asset-1", "--clear-description"]).is_ok());
+    }
+
+    #[test]
+    fn an_album_description_cannot_be_both_written_and_removed() {
+        // The same contradiction as `edit`'s, in the command that did not have the guard:
+        // both parsed, `album update` took the clearing branch, and the description asked
+        // for was discarded without a word, exit 0.
+        assert!(
+            Cli::try_parse_from([
+                "imogen",
+                "album",
+                "update",
+                "Holiday",
+                "-d",
+                "new text",
+                "--clear-description"
+            ])
+            .is_err(),
+            "an album description cannot both be written and removed"
+        );
+        // Both sides alone, so a `conflicts_with` naming the wrong id cannot stop a
+        // legitimate single flag parsing without a test noticing.
+        assert!(
+            Cli::try_parse_from(["imogen", "album", "update", "Holiday", "-d", "new text"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "imogen",
+            "album",
+            "update",
+            "Holiday",
+            "--clear-description"
+        ])
+        .is_ok());
     }
 
     #[test]

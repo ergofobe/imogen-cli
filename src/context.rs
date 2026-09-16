@@ -347,6 +347,23 @@ fn named_album(albums: &[Album], reference: &str) -> Result<Option<Album>> {
     }
 }
 
+/// The name an album will be stored under: trimmed, and never empty.
+///
+/// The mirror of the guard in `albums_for`, on the side that writes. An album called ""
+/// is reachable only by its id ever after — an empty reference is refused when reading,
+/// and no non-empty one matches an empty name — so `album show`, `add`, `remove`,
+/// `delete` and `--album` could never pick it again. Trimmed for the same reason the
+/// reference is: `named_album` compares the stored name trimmed, so a name written with
+/// padding would answer to something it is not spelled as, and `album create " Trip "`
+/// would leave a second album a listing cannot tell from `upload --album Trip`'s.
+pub fn album_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("An album needs a name — an album with none could only ever be named by its id");
+    }
+    Ok(name)
+}
+
 /// Albums for a refusal to name. Each carries its id, because the names are what was
 /// ambiguous: printing "Holiday, Holiday" tells nobody which album to mean.
 fn describe(albums: &[&Album]) -> String {
