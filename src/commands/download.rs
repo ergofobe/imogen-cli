@@ -99,39 +99,44 @@ pub async fn download(ctx: &Context, args: &DownloadArgs) -> Result<()> {
         }
     }
 
-    if ctx.out.is_json() {
-        return ctx.out.json(&json!({
-            "written": written.len(),
-            "skipped": skipped,
-            "failed": failures.len(),
-            "items": written,
-            "failures": failures,
-        }));
+    let report = json!({
+        "written": written.len(),
+        "skipped": skipped,
+        "failed": failures.len(),
+        "items": written,
+        "failures": failures,
+    });
+
+    if !ctx.out.is_json() {
+        for failure in &failures {
+            ctx.out.warn(failure.message());
+        }
+        // A run that got nothing through does not close with a green line saying so: the
+        // sentence `main` is about to print is the whole of what happened.
+        if written.len() + skipped > 0 {
+            let bytes: u64 = written
+                .iter()
+                .filter_map(|item| item["bytes"].as_u64())
+                .sum();
+            ctx.out.note(ctx.out.paint(
+                &format!(
+                    "Wrote {}, {}{}.",
+                    output::plural(written.len(), "file"),
+                    output::bytes(bytes),
+                    if skipped > 0 {
+                        format!(", {skipped} already there")
+                    } else {
+                        String::new()
+                    }
+                ),
+                GREEN,
+            ));
+        }
     }
-    for failure in &failures {
-        ctx.out.warn(failure.message());
-    }
-    let bytes: u64 = written
-        .iter()
-        .filter_map(|item| item["bytes"].as_u64())
-        .sum();
-    ctx.out.note(ctx.out.paint(
-        &format!(
-            "Wrote {}, {}{}.",
-            output::plural(written.len(), "file"),
-            output::bytes(bytes),
-            if skipped > 0 {
-                format!(", {skipped} already there")
-            } else {
-                String::new()
-            }
-        ),
-        GREEN,
-    ));
-    if !failures.is_empty() {
-        bail!("{} failed", output::plural(failures.len(), "file"));
-    }
-    Ok(())
+
+    // A file that was already there was not fetched, but it is on disk, which is what the
+    // caller asked for: it counts as got through rather than as a failure.
+    crate::commands::finish_batch(ctx, report, failures.len(), written.len() + skipped, "file")
 }
 
 async fn resolve(ctx: &Context, args: &DownloadArgs) -> Result<Vec<Asset>> {

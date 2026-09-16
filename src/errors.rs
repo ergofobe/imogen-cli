@@ -102,6 +102,85 @@ impl Failure {
     }
 }
 
+/// What `$?` says. A run that produced nothing exits `FAILED`; a run in which some items
+/// got through and some did not exits `PARTIAL`, because "nothing worked" and "most of it
+/// worked" call for different things from the script that asked. 2 is deliberately not
+/// used: clap already exits with it for a command line it could not parse.
+pub const EXIT_FAILED: i32 = 1;
+pub const EXIT_PARTIAL: i32 = 3;
+
+/// The end of a batch in which the server refused some of the items.
+///
+/// The summary is not thrown away by the failure: the run happened, and what happened to
+/// each item is the answer. So it travels with the error and `main` writes it once — as
+/// the single JSON document the contract promises, or as the sentence that closes a
+/// table. A command that wrote that document itself and *then* returned an error put two
+/// documents on the same stdout, which no ordinary parser will read:
+/// ergofobe/imogen-cli#27.
+#[derive(Debug)]
+pub struct BatchFailure {
+    message: String,
+    everything: bool,
+    report: serde_json::Value,
+}
+
+impl BatchFailure {
+    pub fn new(failed: usize, succeeded: usize, noun: &str, report: serde_json::Value) -> Self {
+        let everything = succeeded == 0;
+        let message = if everything {
+            format!("{} failed", crate::output::plural(failed, noun))
+        } else {
+            format!(
+                "{failed} of {} failed",
+                crate::output::plural(failed + succeeded, noun)
+            )
+        };
+        let mut failure = Self {
+            message,
+            everything,
+            report,
+        };
+        // The one document says both what the run did and that it did not all work, so a
+        // reader looking only for `error` is not misled by a summary full of items.
+        if let Some(object) = failure.report.as_object_mut() {
+            object.insert(
+                "error".to_string(),
+                serde_json::Value::String(failure.message.clone()),
+            );
+        }
+        failure
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        if self.everything {
+            EXIT_FAILED
+        } else {
+            EXIT_PARTIAL
+        }
+    }
+
+    /// The one document `--json` puts on stdout for a failed batch.
+    pub fn report(&self) -> &serde_json::Value {
+        &self.report
+    }
+}
+
+impl std::fmt::Display for BatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BatchFailure {}
+
+/// The batch failure anywhere in the chain, looked for the way `details_in` looks for a
+/// rejection: a command that added context leaves this underneath it.
+pub fn batch_in(error: &anyhow::Error) -> Option<&BatchFailure> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<BatchFailure>())
+}
+
 /// A rejection as the server sends one, for the tests of everything that renders it.
 #[cfg(test)]
 pub fn rejection(details: &[(&str, &[&str])]) -> imogen_sdk::Error {
@@ -190,6 +269,47 @@ mod tests {
         let failure = Failure::new(Path::new("/photos/harbour.jpg"), &error);
         assert!(!failure.message().ends_with('\n'), "{}", failure.message());
         assert_eq!(failure.message().lines().count(), 1);
+    }
+
+    /// A run that got nothing done and a run that got most of it done ask different
+    /// things of the script that called, so they do not share a status.
+    #[test]
+    fn a_batch_that_got_nowhere_is_told_apart_from_one_that_got_part_way() {
+        let nothing = BatchFailure::new(3, 0, "file", serde_json::json!({ "failed": 3 }));
+        assert_eq!(nothing.exit_code(), EXIT_FAILED);
+        assert_eq!(nothing.to_string(), "3 files failed");
+
+        let some = BatchFailure::new(1, 4, "file", serde_json::json!({ "failed": 1 }));
+        assert_eq!(some.exit_code(), EXIT_PARTIAL);
+        assert_eq!(some.to_string(), "1 of 5 files failed");
+    }
+
+    /// The document `--json` writes for a failed batch is the summary of the run, with
+    /// the sentence added so a reader looking only for `error` is not misled by it.
+    #[test]
+    fn the_failed_batchs_document_is_the_summary_plus_the_sentence() {
+        let failure = BatchFailure::new(
+            1,
+            1,
+            "photograph",
+            serde_json::json!({ "updated": 1, "failed": 1 }),
+        );
+        let report = failure.report();
+        assert_eq!(report["updated"], 1);
+        assert_eq!(report["failed"], 1);
+        assert_eq!(report["error"], "1 of 2 photographs failed");
+    }
+
+    /// Found the way a rejection is found, so a command that adds context on the way out
+    /// does not cost the run its exit status.
+    #[test]
+    fn the_batch_survives_a_commands_own_context() {
+        let error = anyhow::Error::new(BatchFailure::new(1, 1, "file", serde_json::json!({})))
+            .context("while uploading");
+        assert_eq!(
+            batch_in(&error).map(BatchFailure::exit_code),
+            Some(EXIT_PARTIAL)
+        );
     }
 
     #[test]

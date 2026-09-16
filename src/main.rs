@@ -16,7 +16,7 @@ use clap::{CommandFactory, Parser};
 
 use crate::cli::{Cli, Command};
 use crate::context::Context;
-use crate::errors::{detail_lines, details_in, Details};
+use crate::errors::{batch_in, detail_lines, details_in, Details, EXIT_FAILED};
 use crate::output::{Output, RED};
 
 fn main() {
@@ -36,8 +36,17 @@ fn main() {
     let out = Output::new(cli.global.json, cli.global.no_color, cli.global.quiet);
     if let Err(error) = runtime.block_on(run(&cli)) {
         report(&out, &error);
-        std::process::exit(1);
+        std::process::exit(exit_code(&error));
     }
+}
+
+/// A batch that got some of its work done is worth telling apart from one that got none,
+/// because the two ask different things of the script that ran it. Everything else is an
+/// ordinary failure.
+fn exit_code(error: &anyhow::Error) -> i32 {
+    batch_in(error)
+        .map(|batch| batch.exit_code())
+        .unwrap_or(EXIT_FAILED)
 }
 
 /// Rust ignores SIGPIPE so that a write to a closed pipe surfaces as an error rather than
@@ -60,7 +69,13 @@ fn restore_sigpipe() {}
 fn report(out: &Output, error: &anyhow::Error) {
     let details = details_in(error);
     if out.is_json() {
-        let _ = out.json(&error_json(error, details));
+        // A batch ran to completion and carries the report of what it did; anything else
+        // has only the failure to describe. Either way this is the one document on
+        // stdout — the command wrote nothing there: ergofobe/imogen-cli#27.
+        let _ = match batch_in(error) {
+            Some(batch) => out.json(batch.report()),
+            None => out.json(&error_json(error, details)),
+        };
         return;
     }
     eprintln!("{}", out.paint(&format!("error: {error}"), RED));
