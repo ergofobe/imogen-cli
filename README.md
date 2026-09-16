@@ -277,7 +277,8 @@ An agent driving this program should know five things:
    `edit` exit **0** when nothing was refused, **1** when nothing got through, and **3**
    when some items succeeded and some were refused. (2 is left to clap, which uses it for
    a command line it could not parse.) A batch that ran writes one document either way —
-   `failed` and `failures` are always in it — and a run that was not wholly successful
+   `failed` and `failures` are in it, as they are not in a `--dry-run`, which lists a
+   plan rather than an outcome — and a run that was not wholly successful
    adds `error` to that document rather than a second one after it. So `$?` says whether
    to look and the summary says at what; there is no `causes` key on a batch, because the
    run itself did not fail, some of its items did. A batch with nothing to do says so on
