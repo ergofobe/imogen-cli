@@ -274,9 +274,12 @@ An agent driving this program should know five things:
    non-zero. Exactly one JSON document reaches stdout, whatever happened.
 2. **The exit status of a batch says how much got through.** `upload`, `download` and
    `edit` exit **0** when nothing was refused, **1** when nothing got through, and **3**
-   when some items succeeded and some were refused. The summary names `failed` and lists
-   `failures` either way, so `$?` says whether to look and the document says at what. (2
-   is left to clap, which uses it for a command line it could not parse.)
+   when some items succeeded and some were refused. (2 is left to clap, which uses it for
+   a command line it could not parse.) Their one document is the summary of the run
+   either way — `failed` and `failures` are always there — and a run that was not wholly
+   successful adds `error` to it rather than a second document after it. So `$?` says
+   whether to look and the summary says at what; there is no `causes` key on a batch,
+   because the run itself did not fail, some of its items did.
 3. **stdout is data, stderr is commentary.** `--quiet` removes the commentary entirely.
 4. **`--yes` is required** for anything destructive selected by filter, because there is no
    terminal to answer a prompt. Naming ids explicitly never prompts.
