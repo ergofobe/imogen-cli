@@ -330,9 +330,12 @@ fn named_album(albums: &[Album], reference: &str) -> Result<Option<Album>> {
         return Ok(Some(exact.clone()));
     }
     let lowered = reference.to_lowercase();
+    // The stored name is trimmed to compare, as the reference was: an album called
+    // " Trip " — from this program, the web interface, or an import — is the album
+    // somebody filing into "Trip" means, and a second one of that name is not.
     let carrying: Vec<&Album> = albums
         .iter()
-        .filter(|album| album.name.to_lowercase() == lowered)
+        .filter(|album| album.name.trim().to_lowercase() == lowered)
         .collect();
     match carrying.len() {
         1 => Ok(Some(carrying[0].clone())),
@@ -418,6 +421,14 @@ mod tests {
          "updatedAt":"2024-01-01T00:00:00Z","shareSlug":null},
         {"id":"album-2","ownerId":"me","name":"Holiday","description":null,
          "coverAssetId":null,"assetCount":4,"createdAt":"2024-01-01T00:00:00Z",
+         "updatedAt":"2024-01-01T00:00:00Z","shareSlug":null}
+    ]}"#;
+
+    /// An album whose stored name carries padding, which nothing stops a client or an
+    /// import from writing.
+    const PADDED_NAME: &str = r#"{"items":[
+        {"id":"album-1","ownerId":"me","name":" Trip ","description":null,
+         "coverAssetId":null,"assetCount":9,"createdAt":"2024-01-01T00:00:00Z",
          "updatedAt":"2024-01-01T00:00:00Z","shareSlug":null}
     ]}"#;
 
@@ -513,6 +524,20 @@ mod tests {
             stub.created().is_empty(),
             "an ambiguous name should not add a third album of that name"
         );
+    }
+
+    #[tokio::test]
+    async fn an_album_whose_stored_name_is_padded_is_still_the_album_of_that_name() {
+        // `imogen album create " Trip "`, or an import that kept the padding. Comparing
+        // the trimmed reference against the untrimmed name would miss it, and filing into
+        // "Trip" would make a second album nobody can tell from the first.
+        let stub = stub_returning(PADDED_NAME).await;
+        let album = context(&stub.base_url)
+            .album_or_create("Trip", None)
+            .await
+            .unwrap();
+        assert_eq!(album.id, "album-1");
+        assert!(stub.created().is_empty(), "the album was already there");
     }
 
     #[tokio::test]
