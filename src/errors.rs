@@ -46,6 +46,11 @@ pub struct Failure {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Details>,
+    /// Whether the failure happened here rather than at the server, which decides only
+    /// which of the two names the sentence leads with. Not serialized: the record is the
+    /// API's own shape, and both names are in it either way.
+    #[serde(skip)]
+    local: bool,
 }
 
 impl Failure {
@@ -57,6 +62,10 @@ impl Failure {
             path: None,
             error: error.to_string(),
             details: error.details().cloned(),
+            // `io::Error` carries no path of its own — "No space left on device" is the
+            // whole of what it knows — so the path this program was writing to is the
+            // only thing that says where the trouble is.
+            local: matches!(error, imogen_sdk::Error::Io(_)),
         }
     }
 
@@ -69,12 +78,14 @@ impl Failure {
         }
     }
 
-    /// `assets edit` works from ids and never touches a file.
+    /// A failure with no file in it at all: `assets edit` works from ids, and so does the
+    /// album an upload could not fill.
     pub fn for_id(id: impl Into<String>, error: &imogen_sdk::Error) -> Self {
         Self::of(error).with_id(id)
     }
 
-    /// A download knows which asset it was fetching; an upload only has the file.
+    /// The second name, for the one command that has both: a download knows the asset it
+    /// was fetching as well as the file it was writing.
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self
@@ -83,8 +94,18 @@ impl Failure {
     /// What a person is told: whichever of the two names the command was working from,
     /// the server's sentence, and under it the fields it refused. Told only that three
     /// files failed, nobody can tell which field of which file was wrong.
+    ///
+    /// A download holds both names, and which one to lead with is the question the
+    /// failure answers: the server refused *this asset*, but the filesystem refused
+    /// *this file*, and being told the asset when the disk filled up leaves the person
+    /// without the directory to go and look at.
     pub fn message(&self) -> String {
-        let head = match self.id.as_deref().or(self.path.as_deref()) {
+        let (first, second) = if self.local {
+            (self.path.as_deref(), self.id.as_deref())
+        } else {
+            (self.id.as_deref(), self.path.as_deref())
+        };
+        let head = match first.or(second) {
             Some(subject) => format!("{subject}: {}", self.error),
             None => self.error.clone(),
         };
@@ -319,6 +340,27 @@ mod tests {
         assert!(failure.message().starts_with("asset-7: "));
         assert!(failure.message().contains("variant: Unknown variant"));
         assert_eq!(serde_json::json!(failure)["path"], "/out/harbour.jpg");
+    }
+
+    /// The other half of the same record: a download that could not be written failed on
+    /// this machine, where the file is the subject. `io::Error` carries no path of its
+    /// own, so naming the asset leaves `warning: asset-7: io: No space left on device` —
+    /// the one thing the person needs, and the one thing it does not say.
+    #[test]
+    fn a_download_that_could_not_be_written_names_the_file() {
+        let error = imogen_sdk::Error::Io(std::io::Error::other("No space left on device"));
+        let failure =
+            Failure::new(Path::new("/out/2024/06/harbour.jpg"), &error).with_id("asset-7");
+        let message = failure.message();
+        assert!(
+            message.starts_with("/out/2024/06/harbour.jpg: "),
+            "{message} names the asset and never the file"
+        );
+        // Both are still recorded: which asset is as much a part of the answer as which
+        // file, and only the sentence has to choose.
+        let record = serde_json::json!(&failure);
+        assert_eq!(record["id"], "asset-7");
+        assert_eq!(record["path"], "/out/2024/06/harbour.jpg");
     }
 
     /// An edit has no file to name, so the record carries the id alone and the person is
