@@ -1,5 +1,6 @@
 //! What a script sees when a batch partly fails: the exit status, and the one document
-//! `--json` promises. ergofobe/imogen-cli#27.
+//! `--json` promises. ergofobe/imogen-cli#27, and the two places that did not reach:
+//! ergofobe/imogen-cli#34.
 //!
 //! These run the real program against a stub that answers the few requests a batch makes,
 //! because the two things under test — `$?` and the bytes on stdout — only exist once
@@ -141,6 +142,24 @@ fn asset(id: &str) -> String {
             "deletedAt":null,"favorite":false,"archived":false,"description":null,
             "exif":null,"location":null,"placeholderColor":null,"livePhotoVideoId":null,
             "deviceAssetId":null}}"#
+    )
+}
+
+/// A library holding one album, which is what `upload --album` looks it up in.
+fn album_called(name: &str) -> String {
+    format!(
+        r#"{{"items":[{{"id":"album-1","ownerId":"owner-1","name":"{name}","description":null,
+            "coverAssetId":null,"assetCount":0,"createdAt":"2024-01-01T00:00:00.000Z",
+            "updatedAt":"2024-01-01T00:00:00.000Z","shareSlug":null}}]}}"#
+    )
+}
+
+/// The album refusing what was uploaded, with the fields it faulted.
+fn full_album() -> (u16, String) {
+    (
+        400,
+        r#"{"error":{"code":"validation_failed","message":"The request did not match what this endpoint expects","details":{"assetIds":["That album will not take any more"]}}}"#
+            .to_string(),
     )
 }
 
@@ -294,6 +313,117 @@ fn a_download_reports_the_same_failure_to_both_audiences() {
     let documents = documents(&json);
     assert_eq!(documents.len(), 1, "{documents:?}");
     assert_eq!(documents[0]["failed"], 1);
+}
+
+/// Filing what was uploaded is the other half of `upload --album`, and a server that
+/// refused it used to be a sentence on stderr: absent from the `--json` document,
+/// `addedToAlbums` silently short, exit 0. ergofobe/imogen-cli#34.
+#[test]
+fn an_album_that_could_not_be_filled_is_a_failure_like_any_other() {
+    let home = tempfile::tempdir().expect("a directory");
+    let server = Server::start(|method, path| match (method, path) {
+        ("GET", "/api/v1/albums") => (200, album_called("Trip")),
+        ("POST", "/api/v1/albums/album-1/assets") => full_album(),
+        _ => uploaded("asset-1"),
+    });
+
+    let only = photograph(home.path(), "one.jpg");
+    let prose = imogen(
+        &server.base,
+        home.path(),
+        &["upload", &only, "--album", "Trip"],
+    );
+    // The file did get through, so this is the partial status rather than the one that
+    // says nothing worked.
+    assert_eq!(prose.status.code(), Some(EXIT_PARTIAL));
+    let commentary = String::from_utf8_lossy(&prose.stderr);
+    assert!(commentary.contains("album-1"), "{commentary}");
+    assert!(
+        commentary.contains("assetIds: That album will not take any more"),
+        "the fields the server named are the point: {commentary}"
+    );
+
+    let json = imogen(
+        &server.base,
+        home.path(),
+        &["--json", "upload", &only, "--album", "Trip"],
+    );
+    assert_eq!(json.status.code(), Some(EXIT_PARTIAL));
+    let documents = documents(&json);
+    assert_eq!(documents.len(), 1, "{documents:?}");
+    assert_eq!(documents[0]["uploaded"], 1);
+    assert_eq!(documents[0]["addedToAlbums"], 0);
+    assert_eq!(
+        documents[0]["failed"], 1,
+        "the count and the list have to agree: {}",
+        documents[0]
+    );
+    assert_eq!(documents[0]["failures"][0]["id"], "album-1");
+    assert_eq!(
+        documents[0]["failures"][0]["details"]["assetIds"][0],
+        "That album will not take any more"
+    );
+    // One file was sent, and it arrived. Closing with "1 of 2 files failed" would say two
+    // were, so a run holding both kinds of item says so.
+    assert_eq!(documents[0]["error"], "1 of 2 items failed");
+    // A file's failure carries the path it was sent from; an album is not a file, which
+    // is what tells the two apart in one list.
+    assert!(
+        documents[0]["failures"][0].get("path").is_none(),
+        "{}",
+        documents[0]
+    );
+}
+
+/// A download that could not be written failed here, not at the server, and
+/// `io::Error` carries no path of its own. Named by the asset, the person is told which
+/// photograph and never which file or directory to go and look at.
+/// ergofobe/imogen-cli#34.
+#[test]
+fn a_download_that_could_not_be_written_names_the_file() {
+    let home = tempfile::tempdir().expect("a directory");
+    let server = Server::start(|_method, _path| (200, asset("asset-1")));
+
+    // A file where the output directory should be: every destination under it fails to
+    // be created, which is this machine's version of the disk being full.
+    let blocked = home.path().join("out");
+    std::fs::write(&blocked, b"not a directory").expect("a file");
+
+    let prose = imogen(
+        &server.base,
+        home.path(),
+        &["download", "asset-1", "-o", &blocked.display().to_string()],
+    );
+    assert_eq!(prose.status.code(), Some(EXIT_FAILED));
+    let commentary = String::from_utf8_lossy(&prose.stderr);
+    assert!(
+        commentary.contains(&blocked.display().to_string()),
+        "the asset is named and the file is not: {commentary}"
+    );
+
+    // The record keeps both: which asset is as much a part of the answer as which file.
+    let json = imogen(
+        &server.base,
+        home.path(),
+        &[
+            "--json",
+            "download",
+            "asset-1",
+            "-o",
+            &blocked.display().to_string(),
+        ],
+    );
+    let documents = documents(&json);
+    assert_eq!(documents.len(), 1, "{documents:?}");
+    assert_eq!(documents[0]["failures"][0]["id"], "asset-1");
+    assert!(
+        documents[0]["failures"][0]["path"]
+            .as_str()
+            .expect("the record names the file")
+            .starts_with(&blocked.display().to_string()),
+        "{}",
+        documents[0]
+    );
 }
 
 /// The rule only earns its keep if a run that worked still says so.
