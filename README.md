@@ -267,15 +267,20 @@ to draw nothing at all.
 
 ## For agents
 
-An agent driving this program should know four things:
+An agent driving this program should know five things:
 
 1. **`--json` on everything.** The payload is the API's own. Errors come back as
    `{"error": "...", "causes": [...]}` on stdout in JSON mode, and the exit status is
-   non-zero.
-2. **stdout is data, stderr is commentary.** `--quiet` removes the commentary entirely.
-3. **`--yes` is required** for anything destructive selected by filter, because there is no
+   non-zero. Exactly one JSON document reaches stdout, whatever happened.
+2. **The exit status of a batch says how much got through.** `upload`, `download` and
+   `edit` exit **0** when nothing was refused, **1** when nothing got through, and **3**
+   when some items succeeded and some were refused. The summary names `failed` and lists
+   `failures` either way, so `$?` says whether to look and the document says at what. (2
+   is left to clap, which uses it for a command line it could not parse.)
+3. **stdout is data, stderr is commentary.** `--quiet` removes the commentary entirely.
+4. **`--yes` is required** for anything destructive selected by filter, because there is no
    terminal to answer a prompt. Naming ids explicitly never prompts.
-4. **`IMOGEN_TOKEN` and `IMOGEN_SERVER`** authenticate a single invocation without touching
+5. **`IMOGEN_TOKEN` and `IMOGEN_SERVER`** authenticate a single invocation without touching
    the credentials file.
 
 ```bash

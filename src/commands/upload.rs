@@ -196,16 +196,16 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
         }
     }
 
-    if ctx.out.is_json() {
-        ctx.out.json(&json!({
-            "uploaded": uploaded.len() - duplicates,
-            "duplicates": duplicates,
-            "failed": failures.len(),
-            "addedToAlbums": added,
-            "items": uploaded,
-            "failures": failures,
-        }))?;
-    } else {
+    let report = json!({
+        "uploaded": uploaded.len() - duplicates,
+        "duplicates": duplicates,
+        "failed": failures.len(),
+        "addedToAlbums": added,
+        "items": uploaded,
+        "failures": failures,
+    });
+
+    if !ctx.out.is_json() {
         for failure in &failures {
             ctx.out.warn(failure.message());
         }
@@ -226,10 +226,8 @@ pub async fn upload(ctx: &Context, args: &UploadArgs) -> Result<()> {
         ctx.out.note(ctx.out.paint(&summary, GREEN));
     }
 
-    if !failures.is_empty() {
-        bail!("{} failed", output::plural(failures.len(), "file"));
-    }
-    Ok(())
+    // A file the server already had is not a file that failed, so it counts as got through.
+    crate::commands::finish_batch(ctx, report, failures.len(), uploaded.len(), "file")
 }
 
 /// One line of the `--report` JSONL: what became of one file, in the API's own field

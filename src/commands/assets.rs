@@ -512,22 +512,24 @@ pub async fn edit(ctx: &Context, args: &EditArgs) -> Result<()> {
         }
     }
 
-    if ctx.out.is_json() {
-        return ctx.out.json(&json!({
-            "updated": updated.len(),
-            "failed": failures.len(),
-            "items": updated,
-            "failures": failures,
-        }));
+    let report = json!({
+        "updated": updated.len(),
+        "failed": failures.len(),
+        "items": updated,
+        "failures": failures,
+    });
+
+    if !ctx.out.is_json() {
+        for failure in &failures {
+            ctx.out.warn(failure.message());
+        }
+        ctx.out.note(ctx.out.paint(
+            &format!("Edited {}.", output::plural(updated.len(), "photograph")),
+            GREEN,
+        ));
     }
-    for failure in &failures {
-        ctx.out.warn(failure.message());
-    }
-    ctx.out.note(ctx.out.paint(
-        &format!("Edited {}.", output::plural(updated.len(), "photograph")),
-        GREEN,
-    ));
-    Ok(())
+
+    crate::commands::finish_batch(ctx, report, failures.len(), updated.len(), "photograph")
 }
 
 fn build_patch(args: &EditArgs) -> Result<AssetUpdate> {
